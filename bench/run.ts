@@ -3,7 +3,6 @@
 
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { compile } from '../nib/compiler.ts'
-import { runtime } from '../nib/loader.ts'
 import { measure, report } from './harness.js'
 
 const dir = import.meta.dir, out = dir + '/out'
@@ -24,8 +23,9 @@ const c = readFileSync(out + '/c.wasm')
 console.log(`clang -O3: ${c.length} bytes     nib: ${wasm.length} bytes, compiled in ${ms.toFixed(2)} ms\n`)
 
 // for boundary.html, which measures calls into the DOM and so needs a browser
-writeFileSync(out + '/boundary.wasm', compile(dir + '/boundary.nib', { read: p => readFileSync(p, 'utf8'), std: dir + '/../std' }).wasm)
-writeFileSync(out + '/runtime.js', `export ${runtime}\n`)
+const boundary = compile(dir + '/boundary.nib', { read: p => readFileSync(p, 'utf8'), std: dir + '/../std' })
+writeFileSync(out + '/boundary.wasm', boundary.wasm)
+writeFileSync(out + '/boundary.js', `export const table = ${JSON.stringify(boundary.table)}\nexport const bindings = ${boundary.bindings}\n`)
 
 if (process.argv.includes('--build-only')) process.exit(0)
 console.log(`JavaScriptCore (Bun ${Bun.version}), ms per call\n${report(measure(c, wasm))}\n`)

@@ -18,9 +18,20 @@ extern call EventTarget.addEventListener(event: ext, cb: func) as on
 extern call EventTarget.dispatchEvent(event: ext): bool
 extern new Event(kind: ext): ext
 extern call Promise.then(cb: func): ext
+extern call Promise.catch(cb: func): ext as on_error
+extern call Promise.resolve(value: any): ext as resolved      // resolved(Promise, value)
+extern val Promise: ext
+extern call Event.preventDefault()
+extern call Element.setPointerCapture(pointer: i32)
 extern call String.slice(start: i32): ext
 
 extern get Event.target: ext
+extern get KeyboardEvent.code: ext
+extern get KeyboardEvent.ctrlKey: bool
+extern get KeyboardEvent.metaKey: bool
+extern get MouseEvent.offsetX: f64
+extern get MouseEvent.offsetY: f64
+extern get PointerEvent.pointerId: i32
 extern get Element.clientWidth: i32
 extern get Element.clientHeight: i32
 extern get HTMLInputElement.value: ext

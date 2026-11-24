@@ -1,0 +1,119 @@
+// Dynamic memory, for sizes only known when the page runs. Statics come first in memory; the
+// heap is everything after them and grows on demand.
+
+import "std/dom"
+
+// ---- blocks: alloc and free
+
+var heap_next = 0
+static heap_free: [i32; 32]            // one list of free blocks per power-of-two size
+
+// Takes fresh bytes from the end of the heap, growing memory at least 1 MiB at a time.
+fn heap_take(size: i32): i32 {
+  if heap_next == 0 { heap_next = heap_base() }
+  let at = heap_next
+  let end = at + size
+  let have = memory_pages() << 16
+  if end > have {
+    if memory_grow(max((end - have + 65535) >> 16, 16)) < 0 { unreachable() }     // out of memory
+  }
+  heap_next = end
+  return at
+}
+
+inline fn size_class(size: i32): i32 { return 32 - clz(max(size, 16) - 1) }
+
+// At least `size` bytes, aligned to 16. Not cleared. Freed blocks are reused by later
+// allocations of a similar size, so both calls take a handful of instructions.
+fn alloc(size: i32): i32 {
+  let class = size_class(size)
+  let block = heap_free[class]
+  if block == 0 { return heap_take(1 << class) }
+  heap_free[class] = (block as *i32)[0]
+  return block
+}
+
+// Gives a block back. `size` is what it was allocated with: the caller always knows.
+fn free(block: i32, size: i32) {
+  let class = size_class(size)
+  (block as *i32)[0] = heap_free[class]
+  heap_free[class] = block
+}
+
+// ---- arenas: allocate by bumping a pointer, free everything at once
+
+struct Arena { start: i32, next: i32, end: i32 }
+
+fn arena_init(a: *Arena, size: i32) {
+  a.start = alloc(size)
+  a.next = a.start
+  a.end = a.start + size
+}
+
+// Aligned to 16. Traps when the arena is full: size it for the worst case.
+inline fn arena_alloc(a: *Arena, size: i32): i32 {
+  let at = a.next
+  let next = at + (size + 15 & -16)
+  if next > a.end { unreachable() }
+  a.next = next
+  return at
+}
+
+inline fn arena_reset(a: *Arena) { a.next = a.start }
+
+// ---- lists: items of one size, packed together
+//
+//   static enemies: [List; 1]
+//   list_init(enemies, sizeof(Enemy), 64)
+//   let e = list_add(enemies) as *Enemy
+//   let all = enemies.items as *Enemy
+//   for i in 0..enemies.count { all[i].x += 1.0 }
+
+struct List { items: i32, count: i32, capacity: i32, stride: i32 }
+
+fn list_init(l: *List, stride: i32, capacity: i32) {
+  l.items = alloc(stride * capacity)
+  l.count = 0
+  l.capacity = capacity
+  l.stride = stride
+}
+
+// Appends an item and returns its address. A full list moves to a block twice the size, so
+// do not keep item pointers across an add.
+fn list_add(l: *List): i32 {
+  if l.count == l.capacity {
+    let bytes = l.capacity * l.stride
+    let bigger = alloc(bytes * 2)
+    memcopy(bigger, l.items, bytes)
+    free(l.items, bytes)
+    l.items = bigger
+    l.capacity *= 2
+  }
+  l.count += 1
+  return l.items + (l.count - 1) * l.stride
+}
+
+// Removes item `index` by moving the last item into its place. Loop backwards to remove while iterating.
+fn list_remove(l: *List, index: i32) {
+  l.count -= 1
+  if index != l.count { memcopy(l.items + index * l.stride, l.items + l.count * l.stride, l.stride) }
+}
+
+// ---- the memory as JavaScript sees it
+//
+// Uploading to the GPU takes an ArrayBuffer. Growing memory replaces that buffer, so it is
+// fetched again whenever the size has changed.
+
+var memory_exports: ext
+var memory_latest: ext
+var memory_latest_pages = 0
+
+fn memory_bind(exports: ext) { memory_exports = exports }       // call once, from main(exports)
+
+fn memory_buffer(): ext {
+  if memory_pages() != memory_latest_pages {
+    memory_latest_pages = memory_pages()
+    memory_latest = buffer(prop(memory_exports, "memory"))
+  }
+  return memory_latest
+}

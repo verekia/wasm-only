@@ -11,3 +11,4 @@ input { width: 100%; margin: 0; accent-color: #e8623a; }
 input[type=color] { height: 24px; padding: 0; border: 0; background: none; }
 output { font-variant-numeric: tabular-nums; }
 #status { position: fixed; inset: 0; display: grid; place-items: center; pointer-events: none; font-size: 16px; }
+a { color: #e8623a; }

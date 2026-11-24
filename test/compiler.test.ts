@@ -1,11 +1,13 @@
 import { test, expect } from 'bun:test'
+import { readFileSync } from 'node:fs'
 import { compile } from '../nib/compiler.ts'
 import { instantiate } from '../nib/loader.ts'
 
 /** Compiles `src` (plus optional extra files) and returns the instance's exports. */
 function run(src: string, files: Record<string, string> = {}): any {
   const all: Record<string, string> = { 'main.nib': src, ...files }
-  const { wasm, bindings } = compile('main.nib', { read: p => { if (p in all) return all[p]; throw new Error('missing ' + p) }, debug: true })
+  const read = (p: string) => p in all ? all[p] : readFileSync(p, 'utf8')          // std/ and examples/ come from the repository
+  const { wasm, bindings } = compile('main.nib', { read, std: import.meta.dir + '/../std', debug: true })
   return instantiate(wasm, bindings).exports
 }
 const fails = (src: string) => { try { run(src) } catch (e: any) { return e.message as string } return '' }
@@ -408,4 +410,115 @@ test('memory builtins', () => {
   expect(x.grow(2)).toBe(1)
   expect(x.pages()).toBe(3)
   expect(x.poke()).toBe(12)
+})
+
+test('std/mem: blocks, arenas, lists and the buffer JavaScript sees', () => {
+  const x = run(`
+    import "std/mem"
+    struct Item { id: i32, v: f64 }
+    static items: [List; 1]
+    static scratch: [Arena; 1]
+    export fn main(exports: ext) { memory_bind(exports) }
+    export fn blocks(): i32 {
+      let p = alloc(100)
+      let q = alloc(100)
+      free(p, 100)
+      let r = alloc(120)                      // the same size class as 100: reuses p
+      let s = alloc(20)
+      return (r == p) as i32 + (q - p == 128) as i32 * 10 + (p & 15 == 0) as i32 * 100 + (s != p && s != q) as i32 * 1000
+    }
+    export fn big(): i32 {
+      let before = memory_pages()
+      let p = alloc(3000000) as *u8
+      p[2999999] = 7
+      return (memory_pages() - before) * 10 + p[2999999]
+    }
+    export fn arena(): i32 {
+      arena_init(scratch, 1024)
+      let a = arena_alloc(scratch, 10)
+      let b = arena_alloc(scratch, 40)
+      arena_reset(scratch)
+      return (b - a) + (arena_alloc(scratch, 8) == a) as i32 * 1000
+    }
+    export fn list(n: i32): f64 {
+      list_init(items, sizeof(Item), 4)
+      for i in 0..n {
+        let it = list_add(items) as *Item          // grows from 4 as needed
+        it.id = i
+        it.v = i as f64 * 0.5
+      }
+      let i = items.count
+      while i > 0 {                                // drop every third item
+        i -= 1
+        if (items.items as *Item)[i].id % 3 == 0 { list_remove(items, i) }
+      }
+      let all = items.items as *Item
+      let sum: f64 = 0.0
+      for j in 0..items.count { sum += all[j].v + all[j].id as f64 * 1000.0 }
+      return sum + items.count as f64 * 1000000.0
+    }
+    export fn buffer_now(): ext { return memory_buffer() }
+  `)
+  x.main(x)
+  const first = x.buffer_now()
+  expect(first).toBe(x.memory.buffer)
+  expect(x.buffer_now()).toBe(first)               // no growth: the same object, no call into JavaScript needed
+  expect(x.blocks()).toBe(1111)
+  expect(x.big()).toBeGreaterThanOrEqual(640 - 160 + 7)
+  expect(first.byteLength).toBe(0)                 // growing detached the old buffer...
+  expect(x.buffer_now()).toBe(x.memory.buffer)     // ...and the next request fetched the new one
+  expect(x.arena()).toBe(16 + 1000)
+  let sum = 0, count = 0
+  for (let i = 0; i < 100; i++) if (i % 3) { sum += i * 0.5 + i * 1000; count++ }
+  expect(x.list(100)).toBe(sum + count * 1000000)
+})
+
+test('std/input and std/loop: actions, edges and fixed ticks', () => {
+  const g = globalThis as any, listeners: Record<string, Function> = {}
+  const target = { addEventListener: (type: string, f: Function) => { listeners[type] = f }, setPointerCapture() {} }
+  let frame: Function = () => {}
+  g.window = target
+  g.requestAnimationFrame = (f: Function) => { frame = f; return 1 }
+  const x = run(`
+    import "std/input"
+    import "std/loop"
+    const LEFT = 1
+    const JUMP = 2
+    var ticks = 0
+    var jumps = 0
+    var left_ticks = 0
+    var drawn: f32 = 0
+    var taps = 0
+    fn update(dt: f32) {
+      ticks += 1
+      if hit(JUMP) { jumps += 1 }
+      if held(LEFT) { left_ticks += 1 }
+      if pointer_hit { taps += 1 }
+    }
+    fn render(blend: f32) { drawn = blend }
+    export fn main(surface: ext) {
+      input_init(surface, { KeyA: LEFT, ArrowLeft: LEFT, Space: JUMP })
+      loop_start()
+    }
+    export fn read(what: i32): f32 {
+      return what == 0 ? ticks as f32 : what == 1 ? jumps as f32 : what == 2 ? left_ticks as f32 : what == 3 ? drawn : what == 4 ? taps as f32 : pointer_x
+    }
+  `)
+  x.main(target)
+  const key = (type: string, code: string, extra = {}) => { let stopped = false; listeners[type]({ code, preventDefault() { stopped = true }, ctrlKey: false, metaKey: false, ...extra }); return stopped }
+  frame(1000)                                              // the first frame only starts the clock
+  expect(key('keydown', 'Space')).toBe(true)               // mapped keys do not scroll the page
+  expect(key('keydown', 'Space')).toBe(true)               // auto-repeat: still held, not hit again
+  expect(key('keydown', 'KeyQ')).toBe(false)               // unmapped keys are left alone
+  expect(key('keydown', 'KeyA', { ctrlKey: true })).toBe(false)
+  frame(1017)                                              // 17 ms: two 120 Hz ticks, a little left over
+  expect([x.read(0), x.read(1), x.read(2)]).toEqual([2, 1, 0])
+  key('keydown', 'ArrowLeft'); key('keyup', 'Space')
+  listeners.pointerdown({ target, pointerId: 1, offsetX: 42.5, offsetY: 7 })
+  frame(1042.5)                                            // a slow frame: three more ticks
+  expect([x.read(0), x.read(1), x.read(2), x.read(4), x.read(5)]).toEqual([5, 1, 3, 1, 42.5])
+  expect(x.read(3)).toBeCloseTo(0.1, 3)                    // 42.5 ms is five ticks and a tenth: draw a tenth of the way on
+  listeners.blur()                                         // focus lost: nothing stays held
+  frame(6042.5)                                            // a long pause is capped at 0.1 s
+  expect([x.read(0), x.read(2)]).toEqual([5 + 12, 3])
 })
