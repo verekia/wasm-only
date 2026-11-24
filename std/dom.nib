@@ -1,0 +1,33 @@
+// Bindings for the parts of the web platform most pages touch. A binding that is never
+// called costs nothing: it does not reach the compiled module.
+
+extern val document: ext
+extern val window: ext
+extern val navigator: ext
+
+extern fn requestAnimationFrame(cb: func): i32
+extern fn Boolean(v: any): bool as truthy                    // false for undefined, null, 0, ""
+extern fn Reflect.get(o: ext, key: any): ext as prop          // o[key]
+extern fn Reflect.set(o: ext, key: any, v: any) as set_prop   // o[key] = v
+extern fn console.log(...)
+extern fn parseInt(s: ext, radix: i32): i32
+
+extern call Document.getElementById(id: ext): ext
+extern call Document.querySelector(css: ext): ext
+extern call EventTarget.addEventListener(event: ext, cb: func) as on
+extern call EventTarget.dispatchEvent(event: ext): bool
+extern new Event(kind: ext): ext
+extern call Promise.then(cb: func): ext
+extern call String.slice(start: i32): ext
+
+extern get Event.target: ext
+extern get Element.clientWidth: i32
+extern get Element.clientHeight: i32
+extern get HTMLInputElement.value: ext
+extern get HTMLInputElement.valueAsNumber: f64
+extern get window.devicePixelRatio: f64                       // globals live on the window object itself
+extern get WebAssembly.Memory.buffer: ext
+
+extern set Node.textContent: any
+extern set HTMLCanvasElement.width: i32
+extern set HTMLCanvasElement.height: i32

@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Nib: a cube in pure Wasm</title>
+<style>
+  html, body { height: 100%; margin: 0; background: #090a0e; color: #d9dce3; font: 14px/1.4 system-ui, sans-serif; }
+  canvas { display: block; width: 100%; height: 100%; }
+  aside {
+    position: fixed; left: 16px; top: 16px; width: 220px; padding: 14px 16px; border-radius: 12px;
+    background: #15171dcc; border: 1px solid #ffffff14; backdrop-filter: blur(10px);
+  }
+  h1 { margin: 0 0 2px; font-size: 15px; font-weight: 600; }
+  p { margin: 0 0 12px; color: #8c92a0; font-size: 12px; }
+  label { display: grid; grid-template-columns: 52px 1fr; align-items: center; gap: 10px; margin-top: 8px; }
+  input { width: 100%; margin: 0; accent-color: #e8623a; }
+  input[type=color] { height: 24px; padding: 0; border: 0; background: none; }
+  output { font-variant-numeric: tabular-nums; }
+  #status { position: fixed; inset: 0; display: grid; place-items: center; pointer-events: none; font-size: 16px; }
+</style>
+<canvas id="view"></canvas>
+<div id="status"></div>
+<aside>
+  <h1>Nib</h1>
+  <p>No JavaScript beyond a fixed loader. <output id="fps">–</output> fps</p>
+  <label>Speed <input id="speed" type="range" min="0" max="4" step="0.05" value="1"></label>
+  <label>Light <input id="light" type="range" min="0" max="360" value="55"></label>
+  <label>Colour <input id="color" type="color" value="#e8623a"></label>
+</aside>
+<script type="nib" src="main.nib"></script>
+</html>

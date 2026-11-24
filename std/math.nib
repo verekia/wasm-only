@@ -1,0 +1,90 @@
+// Float math for graphics. Everything here is plain Wasm: no imports, no tables.
+
+const PI = 3.141592653589793
+const TAU = 6.283185307179586
+
+// Sine by range reduction and an odd polynomial. Error below 1e-6 for everyday angles.
+fn sin(x: f32): f32 {
+  let r = x - TAU * round(x * (1.0 / TAU))                 // wrap into [-pi, pi]
+  if abs(r) > PI * 0.5 { r = (r > 0.0 ? PI : -PI) - r }     // fold into [-pi/2, pi/2]
+  let s = r * r
+  return r * (1.0 + s * (-0.16666667 + s * (0.008333333 + s * (-0.00019841270 + s * (0.0000027557319 - s * 0.000000025052108)))))
+}
+fn cos(x: f32): f32 { return sin(x + PI * 0.5) }
+
+// ---- quaternions (rotations)
+
+struct Quat { x: f32, y: f32, z: f32, w: f32 }
+
+inline fn quat_normalize(q: Quat): Quat {
+  let s = 1.0 / sqrt(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w)
+  return Quat(q.x * s, q.y * s, q.z * s, q.w * s)
+}
+
+inline fn quat_mul(a: Quat, b: Quat): Quat {
+  return Quat(
+    a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+    a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+    a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
+    a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z)
+}
+
+// Turns `q` by the angular velocity (wx, wy, wz), in radians per second, for `dt` seconds.
+// Integrating the rotation directly needs a square root and no trigonometry.
+inline fn quat_spin(q: Quat, wx: f32, wy: f32, wz: f32, dt: f32): Quat {
+  let h = dt * 0.5
+  return quat_normalize(Quat(
+    q.x + h * (wx * q.w + wy * q.z - wz * q.y),
+    q.y + h * (wy * q.w + wz * q.x - wx * q.z),
+    q.z + h * (wz * q.w + wx * q.y - wy * q.x),
+    q.w - h * (wx * q.x + wy * q.y + wz * q.z)))
+}
+
+// ---- 4x4 matrices: four f32x4 columns, the layout WGSL's mat4x4f expects
+
+// out = a * b. `out` may be `a` or `b`.
+inline fn mat4_mul(out: *f32x4, a: *f32x4, b: *f32x4) {
+  let a0 = a[0]
+  let a1 = a[1]
+  let a2 = a[2]
+  let a3 = a[3]
+  inline for j in 0..4 {
+    let c = b[j]
+    out[j] = a0 * splat(c.x) + a1 * splat(c.y) + a2 * splat(c.z) + a3 * splat(c.w)
+  }
+}
+
+inline fn mat4_from_quat(out: *f32x4, q: Quat) {
+  let x2 = q.x + q.x
+  let y2 = q.y + q.y
+  let z2 = q.z + q.z
+  let xx = q.x * x2
+  let xy = q.x * y2
+  let xz = q.x * z2
+  let yy = q.y * y2
+  let yz = q.y * z2
+  let zz = q.z * z2
+  let wx = q.w * x2
+  let wy = q.w * y2
+  let wz = q.w * z2
+  out[0] = f32x4(1.0 - (yy + zz), xy + wz, xz - wy, 0)
+  out[1] = f32x4(xy - wz, 1.0 - (xx + zz), yz + wx, 0)
+  out[2] = f32x4(xz + wy, yz - wx, 1.0 - (xx + yy), 0)
+  out[3] = f32x4(0, 0, 0, 1)
+}
+
+inline fn mat4_translation(out: *f32x4, x: f32, y: f32, z: f32) {
+  out[0] = f32x4(1, 0, 0, 0)
+  out[1] = f32x4(0, 1, 0, 0)
+  out[2] = f32x4(0, 0, 1, 0)
+  out[3] = f32x4(x, y, z, 1)
+}
+
+// Right-handed, looking down -z, depth 0..1 (WebGPU clip space). `f` is 1 / tan(fov / 2).
+inline fn mat4_perspective(out: *f32x4, f: f32, aspect: f32, near: f32, far: f32) {
+  let r = 1.0 / (near - far)
+  out[0] = f32x4(f / aspect, 0, 0, 0)
+  out[1] = f32x4(0, f, 0, 0)
+  out[2] = f32x4(0, 0, far * r, -1)
+  out[3] = f32x4(0, 0, near * far * r, 0)
+}

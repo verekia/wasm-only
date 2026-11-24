@@ -1,0 +1,211 @@
+// A spinning, Lambert-lit cube. This file and cube.wgsl are the whole application.
+
+import "std/math"
+import "std/dom"
+import "std/gpu"
+
+// ---- geometry: built by the compiler, shipped as 600 bytes of data
+
+struct Vertex { px: f32, py: f32, pz: f32, nx: f32, ny: f32, nz: f32 }
+
+static vertices: [Vertex; 24] = comptime build_vertices
+static indices: [u16; 36] = comptime build_indices
+
+fn build_vertices(out: *Vertex) {
+  for face in 0..6 {
+    let axis = face >> 1
+    let side = face & 1 == 0 ? 1.0 : -1.0
+    for corner in 0..4 {
+      let v = &out[face * 4 + corner] as *f32
+      let a = corner == 1 || corner == 2 ? 1.0 : -1.0
+      let b = corner >= 2 ? 1.0 : -1.0
+      v[axis] = side                        // position: the face's plane...
+      v[(axis + 1) % 3] = a * side          // ...and a counter-clockwise walk around it
+      v[(axis + 2) % 3] = b
+      v[3 + axis] = side                    // normal
+    }
+  }
+}
+
+fn build_indices(out: *u16) {
+  for face in 0..6 {
+    let v = face * 4
+    let i = &out[face * 6]
+    i[0] = v
+    i[1] = v + 1
+    i[2] = v + 2
+    i[3] = v
+    i[4] = v + 2
+    i[5] = v + 3
+  }
+}
+
+// ---- state
+
+extern fn Math.tan(x: f64): f64
+const FOCAL = (1.0 / tan(50.0 * PI / 360.0)) as f32     // a 50 degree field of view. The compiler calls Math.tan; the page never does
+
+static uniforms: [f32x4; 10]          // mvp (4 columns), model (4), light, color: mirrors cube.wgsl
+static projection: [f32x4; 4]
+static view: [f32x4; 4]
+static view_projection: [f32x4; 4]
+
+var memory: ext
+var canvas: ext
+var fps_label: ext
+var device: ext
+var queue: ext
+var context: ext
+var format: ext
+var pipeline: ext
+var bind_group: ext
+var vertex_buffer: ext
+var index_buffer: ext
+var uniform_buffer: ext
+var msaa: ext                         // the multisampled texture the cube is drawn into
+var attachment: ext                   // reused every frame; only its resolve target changes
+var pass_descriptor: ext
+
+var rotation = Quat(0, 0, 0, 1)
+var speed: f32 = 1
+var last_time: f64 = 0
+var fps_time: f64 = 0
+var frames = 0
+
+// ---- startup
+
+export fn main(exports: ext) {
+  memory = buffer(prop(exports, "memory"))
+  canvas = getElementById(document, "view")
+  fps_label = getElementById(document, "fps")
+  let api = prop(navigator, "gpu")
+  if !truthy(api) {
+    unsupported()
+    return
+  }
+  format = getPreferredCanvasFormat(api)
+  then(requestAdapter(api), on_adapter)
+}
+
+fn unsupported() { set_textContent(getElementById(document, "status"), "WebGPU is not available in this browser.") }
+
+fn on_adapter(adapter: ext) {
+  if !truthy(adapter) {
+    unsupported()
+    return
+  }
+  then(requestDevice(adapter), on_device)
+}
+
+fn on_device(d: ext) {
+  device = d
+  queue = device_queue(d)
+  context = getContext(canvas, "webgpu")
+  configure(context, { device, format })
+
+  let module = createShaderModule(device, { code: embed("cube.wgsl") })
+  pipeline = createRenderPipeline(device, {
+    layout: "auto"
+    vertex: {
+      module
+      buffers: [{
+        arrayStride: sizeof(Vertex)
+        attributes: [
+          { shaderLocation: 0, offset: 0, format: "float32x3" }
+          { shaderLocation: 1, offset: 12, format: "float32x3" }
+        ]
+      }]
+    }
+    fragment: { module, targets: [{ format }] }
+    primitive: { cullMode: "back" }       // a convex shape needs no depth buffer, only culling
+    multisample: { count: 4 }
+  })
+
+  vertex_buffer = upload(vertices as i32, sizeof(Vertex) * 24, VERTEX)
+  index_buffer = upload(indices as i32, 72, INDEX)
+  uniform_buffer = createBuffer(device, { size: 160, usage: UNIFORM | COPY_DST })
+  bind_group = createBindGroup(device, {
+    layout: getBindGroupLayout(pipeline, 0)
+    entries: [{ binding: 0, resource: { buffer: uniform_buffer } }]
+  })
+  attachment = { clearValue: [0.035, 0.04, 0.055, 1], loadOp: "clear", storeOp: "discard" }
+  pass_descriptor = { colorAttachments: [attachment] }
+
+  mat4_translation(view, 0, 0, -5)
+  on(window, "resize", resize)
+  resize()
+  bind_input("speed", set_speed)
+  bind_input("light", set_light)
+  bind_input("color", set_color)
+  requestAnimationFrame(frame)
+}
+
+fn upload(data: i32, size: i32, usage: i32): ext {
+  let b = createBuffer(device, { size, usage: usage | COPY_DST })
+  writeBuffer(queue, b, 0, memory, data, size)
+  return b
+}
+
+// ---- the page drives the scene: each control's current value is applied, then followed
+
+fn bind_input(id: ext, handler: func) {
+  let input = getElementById(document, id)
+  on(input, "input", handler)
+  dispatchEvent(input, Event("input"))
+}
+
+fn set_speed(e: ext) { speed = valueAsNumber(target(e)) as f32 }
+
+fn set_light(e: ext) {
+  let angle = valueAsNumber(target(e)) as f32 * (PI / 180.0)
+  uniforms[8] = f32x4(cos(angle) * 0.8, 0.6, sin(angle) * 0.8, 0)
+}
+
+fn set_color(e: ext) {
+  let rgb = parseInt(slice(value(target(e)), 1), 16)       // "#rrggbb"
+  uniforms[9] = f32x4((rgb >> 16) as f32, (rgb >> 8 & 255) as f32, (rgb & 255) as f32, 255) * splat(1.0 / 255.0)
+}
+
+fn resize() {
+  let scale = devicePixelRatio(window)
+  let w = max((clientWidth(canvas) as f64 * scale) as i32, 1)
+  let h = max((clientHeight(canvas) as f64 * scale) as i32, 1)
+  set_width(canvas, w)
+  set_height(canvas, h)
+  if truthy(msaa) { destroy_texture(msaa) }
+  msaa = createTexture(device, { size: [w, h], sampleCount: 4, format, usage: RENDER_ATTACHMENT })
+  set_prop(attachment, "view", createView(msaa))
+  mat4_perspective(projection, FOCAL, w as f32 / h as f32, 0.1, 100)
+  mat4_mul(view_projection, projection, view)
+}
+
+// ---- every frame
+
+fn frame(now: f64) {
+  let dt = min((now - last_time) as f32 * 0.001, 0.1)
+  last_time = now
+
+  rotation = quat_spin(rotation, 0.5 * speed, 1.1 * speed, 0.3 * speed, dt)
+  mat4_from_quat(&uniforms[4], rotation)
+  mat4_mul(uniforms, view_projection, &uniforms[4])
+  writeBuffer(queue, uniform_buffer, 0, memory, uniforms as i32, 160)
+
+  set_prop(attachment, "resolveTarget", createView(getCurrentTexture(context)))
+  let encoder = createCommandEncoder(device)
+  let pass = beginRenderPass(encoder, pass_descriptor)
+  setPipeline(pass, pipeline)
+  setBindGroup(pass, 0, bind_group)
+  setVertexBuffer(pass, 0, vertex_buffer)
+  setIndexBuffer(pass, index_buffer, "uint16")
+  drawIndexed(pass, 36)
+  end(pass)
+  submit(queue, [finish(encoder)])
+
+  frames += 1
+  if now - fps_time >= 500.0 {
+    set_textContent(fps_label, round(frames as f64 * 1000.0 / (now - fps_time)))
+    frames = 0
+    fps_time = now
+  }
+  requestAnimationFrame(frame)
+}

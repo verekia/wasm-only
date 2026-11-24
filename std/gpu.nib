@@ -1,0 +1,46 @@
+// WebGPU bindings. Descriptors are ordinary object literals: { size: 64, usage: UNIFORM | COPY_DST }.
+
+extern get Navigator.gpu: ext
+extern call GPU.requestAdapter(): ext                        // a promise
+extern call GPU.getPreferredCanvasFormat(): ext
+extern call GPUAdapter.requestDevice(): ext                  // a promise
+extern call HTMLCanvasElement.getContext(kind: ext): ext
+extern call GPUCanvasContext.configure(desc: ext)
+extern call GPUCanvasContext.getCurrentTexture(): ext
+
+extern get GPUDevice.queue: ext as device_queue
+extern call GPUDevice.createShaderModule(desc: ext): ext
+extern call GPUDevice.createRenderPipeline(desc: ext): ext
+extern call GPUDevice.createBuffer(desc: ext): ext
+extern call GPUDevice.createTexture(desc: ext): ext
+extern call GPUDevice.createBindGroup(desc: ext): ext
+extern call GPUDevice.createCommandEncoder(): ext
+extern call GPURenderPipeline.getBindGroupLayout(index: i32): ext
+extern call GPUTexture.createView(): ext
+extern call GPUTexture.destroy() as destroy_texture
+
+// writeBuffer(queue, buffer, bufferOffset, data, dataOffset, size): with an ArrayBuffer as
+// `data`, the last two are in bytes, so Wasm memory uploads straight from a static's address.
+extern call GPUQueue.writeBuffer(buffer: ext, at: i32, data: ext, start: i32, size: i32)
+extern call GPUQueue.submit(commands: ext)
+
+extern call GPUCommandEncoder.beginRenderPass(desc: ext): ext
+extern call GPUCommandEncoder.finish(): ext
+extern call GPURenderPassEncoder.setPipeline(pipeline: ext)
+extern call GPURenderPassEncoder.setBindGroup(index: i32, group: ext)
+extern call GPURenderPassEncoder.setVertexBuffer(slot: i32, buffer: ext)
+extern call GPURenderPassEncoder.setIndexBuffer(buffer: ext, format: ext)
+extern call GPURenderPassEncoder.draw(vertices: i32)
+extern call GPURenderPassEncoder.drawIndexed(indices: i32)
+extern call GPURenderPassEncoder.end()
+
+// GPUBufferUsage
+const COPY_SRC = 0x04
+const COPY_DST = 0x08
+const INDEX = 0x10
+const VERTEX = 0x20
+const UNIFORM = 0x40
+const STORAGE = 0x80
+// GPUTextureUsage
+const TEXTURE_BINDING = 0x04
+const RENDER_ATTACHMENT = 0x10
