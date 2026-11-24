@@ -639,6 +639,15 @@ class Unit {
       const k = fold(op, t, a.k, b.k)
       if (k !== undefined) return this.kval(cmp ? T.bool : t, k)
     }
+    if (t.kind === 'float') {      // two rewrites that are exact in IEEE arithmetic and that engines do not make themselves
+      if (op === '*' && a.k === 2) [a, b] = [b, a]
+      if (op === '*' && b.k === 2) {                                  // x * 2 → x + x
+        const [once, x] = this.stable(a)
+        return { t, c: [...once, ...x.c, ...x.c, t === T.f32 ? 0x92 : 0xa0], pure: a.pure && !once.length }
+      }
+      const exp = op === '/' && b.k !== undefined ? Math.log2(Math.abs(b.k)) : NaN
+      if (Number.isInteger(exp) && Math.abs(exp) < (t === T.f32 ? 126 : 1022)) { op = '*'; b = this.kval(t, 1 / b.k) }   // x / 2ⁿ → x * 2⁻ⁿ
+    }
     let o: number | undefined
     const bad = (): never => this.err(`${t.name} does not support '${op}'`, n)
     if (t.kind === 'int' || (cmp && t.kind === 'ptr') || (t.kind === 'bool' && '==!=&|^'.includes(op))) {

@@ -325,3 +325,51 @@ test('errors point at the source', () => {
   expect(fails('export fn a() { break }')).toContain('break outside a loop')
   expect(fails('export fn a() {\n  let x = \n}')).toContain("main.nib:3:1: unexpected '}'")
 })
+
+test('assorted code generation paths agree with JavaScript', () => {
+  const x = run(`
+    struct P { a: i16, b: i8, c: f32 }
+    static ps: [P; 16]
+    static src: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8]
+    static dst: [u8; 8]
+    var calls = 0
+    fn tick(v: bool): bool { calls += 1; return v }
+    export fn compound(j: i32, v: i32): i32 {
+      let p = ps as *i16
+      p[j * 4 + 1] = -5
+      p[j * 4 + 1] += v
+      p[j * 4 + 1] *= 3
+      ps[j + 1] = P(-300, -7, 1.5)
+      ps[j + 1].c += 2.0
+      return p[j * 4 + 1] + ps[j + 1].a + ps[j + 1].b + ps[j + 1].c as i32
+    }
+    export fn circuit(a: bool, b: bool): i32 {
+      calls = 0
+      let r = (tick(a) && tick(b)) || (tick(!a) && tick(!b))
+      return calls * 10 + r as i32
+    }
+    export fn clamp(v: i32, lo: i32, hi: i32): i32 { return min(max(v, lo), hi) }
+    export fn umax(a: u32, b: u32): u32 { return max(a, b) }
+    export fn wide(a: i64, b: i64): i64 { return (a << 3 ^ b) / 7 + (a > b ? 1 : 0) as i64 - clz(b) }
+    export fn copy(): i32 { memcopy(dst, &src[2], 4); memfill(&dst[4], 9, 3); return dst[0] + dst[3] * 10 + dst[6] * 100 + dst[7] * 1000 }
+    export fn count(n: u32): u32 { let c: u32 = 0; let i: u32 = 0; while i < n { i += 1; if i % 3 == 0 { continue } c += i } return c }
+    export fn nulls(): i32 { let e: ext = null; return isnull(e) as i32 + (isnull("s") ? 10 : 20) }
+    export fn twice(v: f64): f64 { return 2.0 * v }
+    export fn half(v: f64): f64 { return v / 2.0 }
+    export fn eighth(v: f32): f32 { return (v + 0.0) / 8.0 }
+    export fn third(v: f64): f64 { return v / 3.0 }
+    export fn bits(v: u32): u32 { return popcnt(v) + ctz(v) * 100 + (~v >> 28) * 10000 }
+  `)
+  expect(x.compound(2, 12)).toBe((-5 + 12) * 3 + -300 + -7 + 3)
+  expect([x.circuit(1, 1), x.circuit(1, 0), x.circuit(0, 0), x.circuit(0, 1)]).toEqual([21, 30, 31, 30])
+  expect([x.clamp(5, 0, 3), x.clamp(-5, 0, 3), x.clamp(2, 0, 3)]).toEqual([3, 0, 2])
+  expect(x.umax(-1, 5) >>> 0).toBe(0xffffffff)
+  expect(x.wide(1000n, -3n)).toBe(((1000n << 3n) ^ -3n) / 7n + 1n - 0n)
+  expect(x.copy()).toBe(3 + 6 * 10 + 9 * 100 + 0)
+  let c = 0; for (let i = 1; i <= 100; i++) if (i % 3) c += i
+  expect(x.count(100)).toBe(c)
+  expect(x.nulls()).toBe(21)
+  expect(x.bits(0x00f0)).toBe(4 + 400 + 15 * 10000)
+  expect([x.twice(0.1), x.twice(-Infinity), x.half(0.3), x.half(5e-324), x.eighth(3), x.third(1)]).toEqual([0.2, -Infinity, 0.15, 5e-324 / 2, Math.fround(3 / 8), 1 / 3])
+  expect(x.twice(NaN)).toBeNaN()
+})

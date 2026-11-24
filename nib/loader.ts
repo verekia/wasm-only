@@ -11,7 +11,7 @@
 // Why arrows rather than binding native functions directly: measured in Chromium 158, a
 // Wasm → JS-arrow → DOM call is as fast as hand-written glue, and 10–40% faster than
 // `Function.prototype.call.bind(nativeMethod)`, because each arrow is ordinary JavaScript with
-// its own inline caches. See bench/README.md.
+// its own inline caches. See the measurements in README.md.
 //
 // A binding the browser cannot provide becomes a function that throws when called, so a page
 // still loads and can feature-detect. Evaluating source needs a Content-Security-Policy that
