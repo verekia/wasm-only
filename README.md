@@ -1,257 +1,238 @@
 # Nib
 
-Websites and web games written for WebAssembly directly: a small language whose rules are
-Wasm's own, a compiler with no dependencies, and WGSL for shaders. The only JavaScript on a
-page is a table of one-line bindings that the compiler writes.
+A compiler from TypeScript to WebAssembly, for the parts of a website or game that must be
+fast. There is no new language: a file Nib compiles is an ordinary `.ts` file. It type-checks
+with `tsc`, it runs as plain JavaScript, and it means the same thing both ways.
 
 | | |
 |---|---|
 | ![A lit cube with speed, light and colour controls](docs/cube.png) | ![A small arcade game drawn with instanced cubes](docs/game.png) |
-| [`examples/cube`](examples/cube): a Lambert-lit cube with DOM controls | [`examples/game`](examples/game): game loop, input, dynamic memory, instancing |
+| [`examples/cube`](examples/cube): a Lambert-lit cube with DOM controls | [`examples/game`](examples/game): game loop, input, entity arrays, instancing |
 
-| Shipped | Wasm | Bindings script | HTML |
+| Shipped | Wasm | Bindings module | HTML |
 |---|---|---|---|
-| Cube | 4.53 kB (1.72 kB brotli) | 2.72 kB (1.11 kB) | 0.74 kB |
-| Game | 8.84 kB (3.92 kB brotli) | 3.66 kB (1.42 kB) | 0.65 kB |
+| Cube | 4.01 kB (1.51 kB brotli) | 3.28 kB (1.34 kB) | 0.74 kB |
+| Game | 8.28 kB (3.18 kB brotli) | 4.86 kB (1.75 kB) | 0.66 kB |
 
-Both run under `Content-Security-Policy: default-src 'self'; script-src 'self' 'wasm-unsafe-eval'`:
-no `eval`, no inline scripts, no inline styles.
+Both run under `Content-Security-Policy: default-src 'self'; script-src 'self' 'wasm-unsafe-eval'`.
 
 ## Run it
 
-Needs [Bun](https://bun.sh). There is nothing to install.
+Needs [Bun](https://bun.sh). `bun install` is only for the type checker.
 
 ```sh
-bun run dev      # http://localhost:3000: compiles on every request, reloads on save, sends the policy above
+bun run dev      # http://localhost:3000: compiles on every request, reloads on save
 bun run build    # writes dist/ with content-hashed file names
-bun test
+bun run check    # tsc over the compiler, the library, the examples and the tests
+bun test         # every test program runs compiled and as plain TypeScript; results must match
 bun run bench    # needs clang with the wasm32 target and wasm-ld
 ```
 
-A page opts in with one tag:
+A page loads a program the way it loads any module:
 
 ```html
-<script type="nib" src="main.nib"></script>
+<script type="module" src="main.ts"></script>
 ```
 
-The build turns it into `main-<hash>.wasm`, a preload for it, and `main-<hash>.js`, which holds
-the bindings and starts the module by calling its exported `main`.
+The build compiles `main.ts` to `main-<hash>.wasm` and writes `main-<hash>.js`, an ES module
+with the same exports that loads it. In `nib dev`, add `?js` to a page's URL to run the same
+TypeScript uncompiled, for comparison.
 
-## Why a language
+## What it compiles
 
-C needs a heavy optimiser largely to undo C: locals that might be addressed, pointers that might
-alias, structs that live in memory. Nib cannot express those, so most of what an optimiser would
-do is already true of the source.
+```ts
+import { f32x4, type i32 } from 'nib'
+import { sin } from 'nib/math'
 
-- **Locals have no address.** Every local is a Wasm local; the browser's JIT puts it in a register.
-- **Structs are values.** A struct local is its fields as separate locals, and a struct result is a
-  multi-value return. Structs touch memory only through pointers.
-- **Statics have fixed addresses**, so indexing one folds into a load's constant offset.
-- **`inline fn` and `inline for` always expand**, and constant arguments stay constant inside.
-- **Any expression can run at build time.** The compiler compiles it and runs it in its own
-  engine, so the result is exactly what the page would have computed.
-- **SIMD is a type** (`f32x4`), not something to hope the optimiser finds.
-- **Only what an export reaches is emitted.**
+const COUNT = 4096
+const x = new Float32Array(COUNT), vx = new Float32Array(COUNT)     // memory: fixed addresses in the module
+const table = buildTable()                                          // run by the compiler; ships as data
 
-The compiler is one pass from syntax tree to bytes, about 1,400 lines of TypeScript.
+interface Vec2 { readonly x: number; readonly y: number }           // a value: two locals, never an allocation
+let score = 0                                                        // an integer, because only integers go in
+const label = document.getElementById('score')!                      // a JavaScript value, set at startup
 
-## The language in one page
+function buildTable(): Float32Array {
+  const out = new Float32Array(256)
+  for (let i = 0; i < out.length; i++) out[i] = sin(i / 256 * Math.PI)
+  return out
+}
 
-```rust
-import "std/math"                       // std/ ships with the compiler; other paths are relative
+function add(a: Vec2, b: Vec2): Vec2 { return { x: a.x + b.x, y: a.y + b.y } }
 
-struct Vertex { px: f32, py: f32, pz: f32, nx: f32, ny: f32, nz: f32 }
-
-const FOCAL = (1.0 / tan(0.436)) as f32        // constants are evaluated by the compiler
-extern fn Math.tan(x: f64): f64                //   ...which may call JavaScript to do it
-
-static uniforms: [f32x4; 10]                    // memory with a fixed address; `uniforms` is a *f32x4
-static vertices: [Vertex; 24] = comptime build  // filled by running build(pointer) at build time
-static table: [u16; 4] = [1, 2, 3, 4]
-
-var rotation = Quat(0, 0, 0, 1)                 // Wasm globals; a struct takes one global per field
-var frames = 0
-
-inline fn lerp(a: f32, b: f32, t: f32): f32 { return a + (b - a) * t }
-
-export fn update(dt: f32): f32 {                // every `export fn` is a Wasm export
-  let total: f32 = 0                            // literals take the type they meet; alone, 1 is i32 and 1.0 is f32
-  for i in 0..24 {
-    let v = &vertices[i]                        // & works on memory, never on locals
-    v.py += lerp(0, 9.8, dt)
-    total += v.py > 0.0 ? v.py : -v.py
-  }
-  uniforms[0] = uniforms[1] * splat(dt) + f32x4(0, 0, 0, 1)
-  return total
+export function update(dt: number, steps: i32): void {
+  const k = f32x4.splat(dt)
+  for (let i = 0; i < COUNT; i += 4) f32x4.store(x, i, f32x4.add(f32x4.load(x, i), f32x4.mul(f32x4.load(vx, i), k)))
+  score += steps
+  label.textContent = `Score ${score}`                               // one call into JavaScript
 }
 ```
 
-- **Types:** `i32 u32 i64 u64 f32 f64 bool`, `f32x4`, `ext` (any JavaScript value), `func` (a
-  function reference), structs, pointers `*T`. `i8 u8 i16 u16` exist in memory and widen to `i32`.
-- **Statements:** `let`, assignment and `+=` forms, `if`/`else`, `while`, `loop`,
-  `for i in a..b`, `inline for`, `break`, `continue`, `return`. Semicolons are optional.
-- **Operators** are C's, with `a & 1 == 0` meaning what it looks like, plus `as` casts and
-  `c ? a : b`, which compiles to a branch-free `select` when both sides are cheap.
-- **Built in:** `sqrt abs floor ceil trunc round min max clz ctz popcnt`, `splat` and `.x .y .z .w`
-  on vectors, `sizeof`, `memcopy`, `memfill`, `memory_pages`, `memory_grow`, `heap_base`,
-  `isnull`, `embed("file")`, `comptime expr`.
+- **Numbers.** `number` is a 64-bit float, as in JavaScript. `i32`, `u32` and `f32` are aliases of
+  `number` from `nib` that pick a machine type. A `let` with no annotation is an integer for as
+  long as only integers are assigned to it, and a number otherwise.
+- **Operators do what JavaScript does.** `a / b` is real division; `(a / b) | 0` is integer
+  division. `x | 0`, `x >>> 0`, `Math.imul`, `Math.fround` and the rest of `Math` compile to the
+  matching instructions, or to a call when Wasm has none (`Math.sin`).
+- **Typed arrays are the memory.** One declared at the top of a file has a fixed address, so
+  `x[i]` is a load with a constant offset. `subarray` is a view of the same memory. A typed
+  array built by a function at the top level is computed at build time and shipped as data.
+- **Objects with fixed fields are values.** They live in locals and return as several Wasm
+  values. They are immutable: assign a whole new one.
+- **Functions**, function-typed variables and parameters, and arrow functions that capture
+  nothing. Small functions are inlined; `/** @inline */` forces it. Short loops with constant
+  bounds are unrolled.
+- **`f32x4`** is four float32 lanes in one SIMD register.
+- **Modules.** Relative imports, `nib/*`, and text files. Top-level code runs at startup, in
+  import order, except what the compiler could already compute.
 
-## Talking to the browser
+Not compiled: classes, closures, exceptions, generics, destructuring, `for...of`, `async`,
+strings as Wasm data. A file that needs them stays a normal TypeScript file and imports the
+compiled one.
 
-Wasm can only call what it imports. A binding is declared once and then used like a function:
+## JavaScript values
 
-```rust
-extern val document: ext                                     // a global value
-extern fn requestAnimationFrame(cb: func): i32               // a function
-extern new Uint8Array(buffer: ext): ext                      // a constructor
-extern call GPUQueue.submit(commands: ext)                   // a method: the receiver comes first
-extern get Element.clientWidth: i32                          // a property read
-extern set Node.textContent: any                             // a property write
-extern js now(): f64 = "() => performance.now()"             // anything else
+Anything that is not one of the types above is a JavaScript value: a string, a DOM node, a
+`GPUDevice`. Nib needs no declarations for them. It reads the expression as written and turns
+it into one arrow function, with constants written in and whole call chains fused:
 
-on(getElementById(document, "speed"), "input", set_speed)    // a Nib function is a valid callback
+```ts
+device.createBuffer({ size: n * 4, usage: GPUBufferUsage.VERTEX })
+// (a,b)=>a.createBuffer({size:b,usage:GPUBufferUsage.VERTEX})
+
+queue.submit([encoder.finish()])
+// (a,b)=>a.submit([b.finish()])
+
+pass = encoder.beginRenderPass({ colorAttachments: [{ view, resolveTarget: context.getCurrentTexture().createView(), ... }] })
+// one call, where hand-written glue usually makes three
 ```
 
-For each distinct use the compiler writes one line of JavaScript with exactly that call's
-arity. Object and array literals in Nib source become one such line too, with their constants
-written in:
+A typed array passed to JavaScript arrives as a view of the module's memory, so
+`queue.writeBuffer(buffer, 0, vertices)` uploads with no copy on the Wasm side. A Nib function
+passed to JavaScript is a callback.
 
-```rust
-submit(queue, list)                                          // (a,b)=>a.submit(b)
-createBuffer(device, { size, usage: UNIFORM | COPY_DST })    // (a)=>({size:a,usage:72})
+The arrows go into a table in the generated module, and the Wasm imports from it by position.
+The table's name is a hash of its contents, so a module cannot link against a table from
+another build. Nothing is evaluated from strings.
+
+## The generated module
+
+`main.js` exports what `main.ts` exports: functions, constants, and typed arrays as live
+views. Other code imports it like the TypeScript file it replaces:
+
+```ts
+import { update, positions } from './sim.js'     // was './sim.ts'
+update(1 / 60, 1)
+gl.bufferData(gl.ARRAY_BUFFER, positions, gl.DYNAMIC_DRAW)       // the module's own memory, no copy
 ```
 
-The lines go into a table, and the module imports from it by position. This is the entire
-script of a page (the cube's has 77 entries):
+That is the way into an existing engine: move one kernel and its data to a file, keep
+everything else.
 
-```js
-WebAssembly.instantiateStreaming(fetch("main-1594si7a.wasm"),
-  (F => ({ n1q4ra8a: [
-    (a,b)=>a.getElementById(b),
-    (a,b)=>({device:a,format:b}),
-    globalThis.requestAnimationFrame||F,
-    globalThis.document,
-    "input",
-    /* ... */
-  ] }))(() => { throw Error("nib: missing binding") })
-).then(r => r.instance.exports.main?.(r.instance.exports))
-```
+## Where compiled and plain differ
 
-- The table's name is a hash of its contents, so a module can never link against a table from
-  another build; build output is content-hashed for the same reason, and can be cached forever.
-- A function the browser lacks becomes `F`, which throws when called rather than at load, so a
-  page can feature-detect.
-- Nothing is evaluated from strings at run time.
+The two agree bit for bit except here. Each is a place where JavaScript's answer is a number
+that no fast integer can hold.
 
-## The standard library
+- **`i32` arithmetic wraps** past ±2³¹; JavaScript keeps counting. Write `Math.imul` or `| 0`
+  where you mean to wrap, and use `number` where values can be large. (`u32` arithmetic is done
+  in doubles, so it is exact.)
+- **Integer zero has no sign**: `-i` is `0`, not `-0`.
+- **Integer division or remainder by zero traps** instead of giving `Infinity` or `NaN`.
+- **Reading past the end of an array** gives whatever is there, not `undefined`.
+- **Float to integer** (`x | 0`) is exact for finite values below 2⁶³; beyond that and for
+  `Infinity` it differs.
+- **`new Float32Array(n)` inside a function** takes memory that is never returned.
 
-Six files of Nib, about 500 lines. A binding or function that is not used costs nothing.
+## The library
+
+Plain TypeScript in [`lib/`](lib), about 330 lines. It runs uncompiled too.
 
 | | |
 |---|---|
-| `std/math` | `sin`, `cos`, `clamp`, `random`; quaternions; 4×4 matrices on `f32x4` (`mat4_mul`, `mat4_perspective`, `mat4_look_at`, ...) |
-| `std/mem` | `alloc`/`free` (size classes, grows memory on demand), `Arena` (bump, reset at once), `List` (packed items, swap-remove) |
-| `std/input` | Keys mapped to action bits, `held(LEFT)` and `hit(JUMP)`, pointer position and press |
-| `std/loop` | A fixed 120 Hz update with interpolated drawing: define `update(dt)` and `render(blend)` |
-| `std/dom` | The common DOM bindings |
-| `std/gpu` | WebGPU bindings, `gpu_start(canvas, ready, failed)`, `gpu_fit()`, `gpu_buffer(address, size, usage)` |
+| `nib` | The number types and `f32x4` |
+| `nib/math` | `sin`, `cos`, `clamp`, `random`; quaternions; 4×4 matrices on `Float32Array` |
+| `nib/input` | Keys mapped to action bits, `held(LEFT)` and `hit(JUMP)`, the pointer |
+| `nib/loop` | `loopStart(update, render)`: a fixed 120 Hz update with interpolated drawing |
+| `nib/gpu` | `gpuStart(canvas, ready, failed)`, `gpuFit()`, `gpuBuffer(data, usage)` |
 
-The game uses all of them. Its entities live in `List`s, each frame's instance data is built
-in an `Arena` and uploaded from Wasm memory in one `writeBuffer`, and everything on screen is
-one instanced draw call:
-
-```rust
-fn update(dt: f32) {                    // called by std/loop, 120 times a second
-  let ax = (held(RIGHT) as i32 - held(LEFT) as i32) as f32
-  ...
-  let all = hazards.items as *Hazard
-  for i in 0..hazards.count {
-    let h = &all[i]
-    h.x += h.vx * dt
-    ...
-  }
-}
-```
-
-`std/loop` and the game find each other by name: there are no function pointers between Nib
-functions, so `update` and `render` are direct calls.
+There are no DOM or WebGPU bindings to maintain: the examples call both directly, typed by
+`lib.dom.d.ts` and `@webgpu/types`.
 
 ## Measurements
 
-All on one shared 4-core x86-64 machine; treat a few percent as noise. `bun run bench` rebuilds
-and reruns everything except the browser pages, which are `bench/index.html` and
-`bench/boundary.html`.
+One shared 4-core x86-64 machine; treat a few percent as noise.
 
-### Against C
+### One source, three ways
 
-The same eight kernels in [`bench/kernels.c`](bench/kernels.c) (`clang -O3 -msimd128`) and
-[`bench/kernels.nib`](bench/kernels.nib), written the same way, run in the same engine. Every
-kernel returns bit-identical results from both. Chromium 158, milliseconds per call, best of 7:
+[`bench/kernels.ts`](bench/kernels.ts) compiled by Nib, the same file run as JavaScript, and
+[`bench/kernels.c`](bench/kernels.c) through `clang -O3`. All three return identical bits on
+every kernel. Chromium 158, milliseconds per call, best of 7:
 
-| Kernel | clang -O3 | Nib | Nib / C |
-|---|---|---|---|
-| hash: integer mixing | 47.4 | 41.7 | 0.88 |
-| mat4: 4×4 products, written with `f32x4` | 12.6 | 10.9 | 0.87 |
-| particles, written with `f32x4` | 2.6 | 2.5 | 0.96 |
-| sieve: byte loads and stores | 6.6 | 6.4 | 0.97 |
-| mandelbrot: f64 in locals | 30.1 | 30.2 | 1.00 |
-| nbody: f64 structs in memory | 8.5 | 10.2 | 1.20 |
-| fib: recursion | 7.7 | 13.1 | 1.70 |
-| particles, written as a plain loop | 2.6 | 13.4 | 5.15 |
+| Kernel | clang -O3 | Nib | plain JS | Nib / C | JS / C |
+|---|---|---|---|---|---|
+| hash: integer mixing | 47.4 | 41.6 | 120.9 | 0.88 | 2.55 |
+| sieve: byte loads and stores | 6.7 | 6.3 | 8.6 | 0.94 | 1.28 |
+| mandelbrot: doubles in locals | 29.5 | 30.2 | 30.7 | 1.02 | 1.04 |
+| particles: doubles, float32 arrays | 24.1 | 25.4 | 27.7 | 1.05 | 1.15 |
+| nbody: doubles in an array | 8.5 | 10.3 | 19.4 | 1.21 | 2.28 |
+| fib: recursion | 7.6 | 13.2 | 16.6 | 1.74 | 2.18 |
+| mat4: doubles, unrolled by hand | 12.8 | 24.1 | 33.8 | 1.88 | 2.64 |
+| mat4 with `f32x4` | 12.6 | 10.9 | n/a | 0.87 | |
+| particles with `f32x4` | 2.6 | 2.6 | n/a | 1.00 | |
 
-JavaScriptCore (Bun 1.4.4) shows the same picture. Its largest difference is `mat4`, where Nib is
-1.17× clang's time instead of 0.87×.
+- Compiled, the same TypeScript is 1.0× to 2.9× faster than it is as JavaScript.
+- Written with `f32x4`, the particle update is 10× faster than the plain loop, in the same
+  language. JavaScript has no equivalent, so `f32x4` uncompiled is a slow stand-in used only
+  to check answers.
+- clang still wins where it restructures code: it turns one of `fib`'s calls into a loop, and
+  it keeps the matrix in registers across iterations. Nib compiles what is written.
 
-Where Nib loses, and why:
-
-- **Plain loops over arrays (5×).** LLVM turns the loop into SIMD by itself; Nib never does.
-  Written with `f32x4`, the same loop matches LLVM's version.
-- **Recursion (1.7×).** LLVM rewrites one of `fib`'s two recursive calls into a loop.
-- **Repeated reads through pointers (1.2×).** LLVM proves two pointers differ and keeps values in
-  registers; Nib reloads whatever the source reloads. Reading a field into a `let` fixes it.
-
-Binaryen's `wasm-opt -O3` on Nib's output makes it 4–8% smaller and no faster on these kernels,
-at 330 ms a run, so it is not part of the build.
+Bun (JavaScriptCore) and Node (V8 12.4) give the same picture; `bun run bench` prints both.
 
 ### Calling the DOM from Wasm
 
-Three ways to bind the same six DOM members, nanoseconds per call from Wasm, Chromium 158:
+Three ways to bind the same DOM members, nanoseconds per call, Chromium 158
+(`bench/boundary.html`):
 
 | Binding | method | getter | method, no arguments | plain function |
 |---|---|---|---|---|
-| Nib: one arrow per call shape | 31 | 9 | 59 | 11 |
-| `Function.prototype.call.bind(native)` | 34 | 15 | 67 | 11 |
-| One generic closure per kind (`o[name](...args)`) | 36 | 9 | 70 | 11 |
+| Nib: one arrow per call shape | 29 | 9 | 60 | 12.5 |
+| `Function.prototype.call.bind(native)` | 33 | 15 | 68–73 | 11.5–14 |
+| One generic closure per kind | 34 | 9 | 72 | 15.5 |
 
-Setters and layout-dependent getters cost 215–240 ns under every scheme: the browser's own work
-dominates. An arrow matches hand-written glue because that is what it is.
+Setters and layout-dependent getters cost 215–250 ns under every scheme.
 
 ### Compile time
 
 | | |
 |---|---|
-| The cube: 570 lines with the libraries it imports | 3.5 ms |
-| The game: 990 lines with the libraries it imports | 5.3 ms |
-| `nib build examples`, both sites, from a cold start | 90 ms |
+| The cube: 360 lines with the library it imports | 4.4 ms |
+| The game: 740 lines with the library it imports | 10 ms |
+| `nib build examples`, both sites, from a cold start | about 100 ms |
+
+The compiler is one pass from syntax tree to bytes, about 2,300 lines of TypeScript with no
+dependencies.
 
 ## Limits
 
-- No auto-vectorisation, no alias analysis, no loop restructuring. Speed comes from writing the
-  fast form, and the language is small enough that the fast form is usually the obvious one.
-- One global namespace; no closures, generics, methods or function pointers between Nib functions.
-- Strings exist only as `ext` values. Building one means calling JavaScript.
-- `free` needs the size, and freed memory is never returned to the browser.
-- Wasm GC types are not used.
-- Verified in Chromium 158 with WebGPU on a software adapter, including keyboard and pointer play
-  and the strict policy above. Everything without a DOM is also tested in Bun and Node. Not yet
-  run in Firefox or Safari, or on a real GPU or touch screen.
+- No auto-vectorisation, no alias analysis, no loop restructuring: see the table.
+- No scalar fallback for `f32x4` yet, so a compiled module that uses it needs Wasm SIMD
+  (Safari 16.4 or later).
+- Memory is typed arrays of fixed size, plus allocation that is never freed. There is no
+  garbage collector and no `free`.
+- Exported functions take numbers, booleans, JavaScript values and value objects; they cannot
+  take a typed array or a function from JavaScript.
+- Verified in Chromium 158 with WebGPU on a software adapter, compiled and uncompiled,
+  including keyboard and pointer play and the strict policy above. Everything without a DOM
+  also runs in Bun and Node. Not yet run in Firefox or Safari, or on a real GPU or touch screen.
 
 ## Layout
 
 ```
-nib/        syntax.ts (lexer, parser)   compiler.ts (checker, emitter)   loader.ts   cli.ts
-std/        math   mem   input   loop   dom   gpu
-examples/   cube/   game/   shared/cube.nib
-bench/      kernels.nib   kernels.c   boundary.nib   harness.js   run.ts   *.html
+nib/        syntax.ts (parser)   compiler.ts (checker, emitter)   loader.ts   cli.ts
+lib/        index.ts   math.ts   input.ts   loop.ts   gpu.ts
+examples/   cube/   game/   shared/cube.ts
+bench/      kernels.ts   kernels.c   boundary.ts   harness.js   run.ts   *.html
 test/       compiler.test.ts
 ```

@@ -1,5 +1,7 @@
 import { measure, report } from './harness.js'
+import * as nib from './out/nib.js'
+import * as js from './kernels.ts?js'
 
-const bytes = async url => new Uint8Array(await (await fetch(url)).arrayBuffer())
-document.getElementById('out').textContent = report(measure(await bytes('out/c.wasm'), await bytes('out/nib.wasm')))
+const c = (await WebAssembly.instantiateStreaming(fetch('out/c.wasm'), {})).instance.exports
+document.getElementById('out').textContent = report(measure(c, nib, js))
 window.done = true

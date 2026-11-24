@@ -402,7 +402,7 @@ test('modules, the library, text imports and startup order', async () => {
         mat4Mul(matrices, matrices, matrices.subarray(16, 32))
         return matrices
       }
-      export function misc(): number { bump(); return twice(SIZE) + counter + shader.length + startedAt }
+      export function misc(): number { bump(); return twice(SIZE) + counter + shader.length + (startedAt > 0 ? 1 : 0) }
       export function text(): string { return shader }
     `,
     'lib/util.ts': `

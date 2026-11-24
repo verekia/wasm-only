@@ -158,6 +158,7 @@ interface Js {
   pure: boolean           // only Math functions: safe to run at build time
   prec: number            // 20 member/call/primary ... 3 conditional ... 2 assignment
   object?: boolean        // starts with `{`
+  gives?: Type            // the operator settles the result: a - b is a number whatever a and b are
 }
 const jsText = (text: string, prec = 20): Js => ({ src: [text], params: [], ops: false, pure: true, prec })
 function jsJoin(parts: (string | Js)[], prec: number, ops = false): Js {
@@ -417,7 +418,7 @@ class Program {
       const u = new Unit(this)                         // not constant: learn its type, and set it at startup
       u.mod = d.mod
       const v = u.expr(d.e, want)
-      const t = want ?? (v.t === HOST ? T.ext : v.t === INT || v.t === FLOAT || v.t === T.f32 ? T.f64 : v.t === FNREF ? this.fnTypeOf(v.fn) : v.t)
+      const t = want ?? (v.t === HOST ? v.js!.gives ?? T.ext : v.t === INT || v.t === FLOAT || v.t === T.f32 ? T.f64 : v.t === FNREF ? this.fnTypeOf(v.fn) : v.t)
       return done({ t, runtime: true })
     }
   }
@@ -683,6 +684,13 @@ class Unit {
     if (v.k !== undefined) return this.kval(T.f32, Number(v.k))
     return { t: T.f32, c: [...v.c, v.t === T.f64 ? 0xb6 : v.t === T.u32 ? 0xb3 : 0xb2], pure: v.pure }
   }
+  /** A float32 from an expression, with no detour through float64 when it already is one. */
+  private single(n: any): Val {
+    let v = this.expr(n)
+    if (v.t === HOST) v = this.force(v, T.f32, n)
+    if (!isNum(v.t)) this.err(`expected a number, found ${v.t.name}`, n)
+    return this.toF32(v)
+  }
   /** What a typed array stores when given `v`. */
   private toElement(v: Val, el: Type, n: any): Val {
     if (v.t === HOST) v = this.force(v, el.kind === 'float' ? T.f64 : T.i32, n)
@@ -695,6 +703,7 @@ class Unit {
     if (v.t === t) return v
     if (v.t === HOST) return this.force(v, t, n)
     if (t === T.ext || t === HOST) return this.force(this.lazy(this.js(v, n)), T.ext, n)     // hand a Wasm value to JavaScript
+    if (v.t === T.ext && (isNum(t) || t === T.bool)) return this.force(this.lazy(this.js(v, n)), t, n)   // and read one back
     if (v.t === FNREF && t.kind === 'fn') {
       const s = this.P.sig(v.fn)
       if (this.P.fnType(s.params, s.ret) !== t) this.err(`'${v.fn.name}' is not a ${t.name}`, n)
@@ -712,11 +721,11 @@ class Unit {
   }
   /** The type an unannotated `let` gets from its first value. */
   private settle(v: Val, node: any): Val {
-    if (v.t === HOST) return this.force(v, T.ext, node)
+    if (v.t === HOST) return this.force(v, v.js!.gives ?? T.ext, node)
     if (v.t === FNREF) return this.coerce(v, this.P.fnTypeOf(v.fn), node)
     if (node && this.P.isWide(this.mod, node) && isNum(v.t)) return this.toF64(v)
     if (v.t === INT) return Number.isInteger(v.k) && Math.abs(v.k) < 2 ** 31 ? this.kval(T.i32, v.k) : this.kval(T.f64, v.k)
-    if (v.t === FLOAT || v.t === T.f32) return this.toF64(v)
+    if (v.t === FLOAT) return this.toF64(v)
     return v
   }
   /** A condition: non-zero is true. `normalize` forces exactly 0 or 1. */
@@ -809,7 +818,8 @@ class Unit {
   }
   private jsBinary(op: string, a: Val, b: Val, n: any): Js {
     const p = JS_PREC[op], [x, y] = this.ordered([this.js(a, n), this.js(b, n)], n)
-    return jsJoin([jsWrap(x, p), op, jsWrap(y, p + 1)], p)
+    const gives = '-*/%'.includes(op) ? T.f64 : op === '>>>' ? T.u32 : BITWISE.has(op) ? T.i32 : COMPARE.has(STRICT[op] ?? op) ? T.bool : undefined
+    return { ...jsJoin([jsWrap(x, p), op, jsWrap(y, p + 1)], p), gives }
   }
 
   // ---- expressions
@@ -863,9 +873,10 @@ class Unit {
         if (isPlace(r) && r.t.kind === 'struct') return this.field(r, n)
         const v = isPlace(r) ? this.load(r) : r
         if (v.t.kind === 'array') {
-          if (n.name !== 'length') this.err(`a typed array has no property '${n.name}' here`, n)
-          const [pre, , len] = this.span(r)
-          return pre.length ? { t: T.i32, c: [...pre, ...len.c] } : len
+          if (n.name !== 'length' && n.name !== 'byteLength') this.err(`a typed array has no property '${n.name}' here`, n)
+          const [pre, , len] = this.span(r), size = n.name === 'length' ? 1 : v.t.el!.size
+          if (len.k !== undefined) return this.kval(T.i32, len.k * size)
+          return { t: T.i32, c: [...pre, ...len.c, ...(size > 1 ? [...i32const(size), 0x6c] : [])], pure: !pre.length && len.pure }
         }
         if (v.t.kind === 'struct') return this.field(this.spill(v), n)
         if (v.t === T.f32x4 && n.name.length === 1 && LANES.includes(n.name)) {
@@ -916,6 +927,13 @@ class Unit {
   private element(arr: Val | Place, index: any, el: Type, n: any): Place {
     this.usesMem = true
     const [pre, ptr] = this.span(arr)
+    let extra = 0
+    if (index.n === 'bin' && index.op === '+') {          // a[i + 2]: the constant part goes into the load's offset
+      const x = this.expr(index.a), y = this.expr(index.b)
+      const k = (v: Val) => v.k !== undefined && isNum(v.t) && Number.isInteger(v.k) && v.k >= 0 && v.k < 2 ** 20
+      if (k(y) && x.t === T.i32 && x.k === undefined) { index = index.a; extra = y.k * el.size }
+      else if (k(x) && y.t === T.i32 && y.k === undefined) { index = index.b; extra = x.k * el.size }
+    }
     let i = this.expr(index)
     if (i.t === HOST) i = this.force(i, T.i32, index)
     if (!isNum(i.t)) this.err(`an index must be a number, found ${i.t.name}`, index)
@@ -924,6 +942,10 @@ class Unit {
       const off = i.k * el.size
       if (off >= 0) return { p: 'mem', t: el, base: ptr, off, pre }
       return { p: 'mem', t: el, base: { t: T.i32, c: [...ptr.c, ...i32const(off), 0x6a], pure: ptr.pure }, off: 0, pre }
+    }
+    if (extra) {
+      const at = this.element(arr, index, el, n) as Place & { p: 'mem' }
+      return { ...at, off: at.off + extra }
     }
     // Indexing by a loop counter reads a second counter that advances by the element size,
     // instead of multiplying on every access.
@@ -1042,7 +1064,8 @@ class Unit {
 
   private unary(n: any): Val {
     const v = this.expr(n.e), t = v.t
-    if (n.op === 'typeof ' || (isJs(t) && n.op !== '!')) return this.lazy(jsJoin([n.op, jsWrap(this.js(v, n), 15)], 15))
+    if (n.op === 'typeof ' || (isJs(t) && n.op !== '!'))
+      return this.lazy({ ...jsJoin([n.op, jsWrap(this.js(v, n), 15)], 15), gives: n.op === '~' ? T.i32 : n.op === 'typeof ' ? undefined : T.f64 })
     if (n.op === '!') {
       const c = this.truthy(v, n)
       return c.k !== undefined ? this.kval(T.bool, !c.k) : { t: T.bool, c: [...c.c, 0x45], pure: c.pure }
@@ -1101,7 +1124,8 @@ class Unit {
       if (b) return this.callValue(isPlace(b) ? this.load(b) : b, n)
       const r = this.P.resolve(this.mod, f.name)
       if (r?.intrinsic === 'f32x4') {
-        const vs = this.args(n, [T.f64, T.f64, T.f64, T.f64]).map(v => this.toF32(v))
+        if (n.args.length !== 4) this.err('f32x4(x, y, z, w)', n)
+        const vs: Val[] = n.args.map((a: any) => this.single(a))
         if (vs.every(v => v.k !== undefined)) return this.kval(T.f32x4, vs.map(v => v.k))
         return { t: T.f32x4, c: [...vs[0].c, ...simd(0x13), ...[1, 2, 3].flatMap(i => [...vs[i].c, ...simd(0x20), i])], pure: vs.every(v => v.pure) }
       }
@@ -1297,7 +1321,7 @@ class Unit {
     }
     if (fn === 'splat') {
       need(1)
-      const v = this.toF32(this.value(a[0], T.f64))
+      const v = this.single(a[0])
       return v.k !== undefined ? this.kval(T.f32x4, [v.k, v.k, v.k, v.k]) : { t: T.f32x4, c: [...v.c, ...simd(0x13)], pure: v.pure }
     }
     if (fn === 'load') { need(2); const pl = lanes(0); return { t: T.f32x4, c: [...(pl.pre ?? []), ...(pl as any).base.c, 0xfd, 0, 2, ...uleb((pl as any).off)] } }
@@ -1392,12 +1416,12 @@ class Unit {
   /** A value on its way into a variable whose integer type was inferred. If it does not fit, the variable becomes a number and the function is compiled again. */
   private fit(v: Val, pl: Place, n: any): Val {
     const inferred = pl.p === 'loc' ? pl.node : pl.p === 'glob' ? pl.decl : undefined
-    if (inferred && pl.t.kind === 'int' && (isNum(v.t) || v.t === HOST)) {
-      const fits = v.t === pl.t || (v.t === INT && Number.isInteger(v.k) && (pl.t === T.u32 ? v.k >= 0 : true) && Math.abs(v.k) < 2 ** 31)
+    if (inferred && (pl.t.kind === 'int' || pl.t === T.f32) && (isNum(v.t) || v.t === HOST)) {
+      const fits = v.t === pl.t || (pl.t === T.f32 && v.t.kind === 'lit' && Math.fround(v.k) === v.k) || pl.t !== T.f32 && (v.t === INT && Number.isInteger(v.k) && (pl.t === T.u32 ? v.k >= 0 : true) && Math.abs(v.k) < 2 ** 31)
       if (!fits) {
         if (pl.p === 'glob') { this.P.widen(inferred.mod, inferred); this.P.restart = true }
         else { this.P.widen(this.mod, inferred); this.demoted = true }
-        return v.t === HOST ? this.force(v, pl.t, n) : this.toI32(v.t.kind === 'lit' ? this.kval(T.f64, v.k) : v, pl.t)
+        return v.t === HOST ? this.force(v, pl.t, n) : pl.t === T.f32 ? this.toF32(v) : this.toI32(v.t.kind === 'lit' ? this.kval(T.f64, v.k) : v, pl.t)
       }
     }
     if (pl.p === 'mem') return this.toElement(v, pl.t, n)
@@ -1494,15 +1518,15 @@ class Unit {
   }
 
   /**
-   * `for (let i = a; i < b; i++)` over integers, when the body leaves `i` alone. The counter gets
+   * `for (let i = a; i < b; i++)` (or `i += 4`) over integers, when the body leaves `i` alone. The counter gets
    * pre-multiplied copies for array indexing, and a short loop with constant bounds is unrolled.
    */
   private counted(s: any): Code | undefined {
     const init = s.init[0], id = init?.name, step = s.update[0]
     if (s.init.length !== 1 || init.n !== 'let' || !init.e || s.update.length !== 1 || s.c?.n !== 'bin' || s.c.op !== '<' || s.c.a.n !== 'id' || s.c.a.name !== id) return
-    const plusOne = (step.n === 'expr' && step.e.n === 'incr' && step.e.d === 1 && step.e.e.n === 'id' && step.e.e.name === id) ||
-      (step.n === 'assign' && step.op === '+=' && step.to.n === 'id' && step.to.name === id && step.e.n === 'num' && step.e.v === 1)
-    if (!plusOne) return
+    const by: number = step.n === 'expr' && step.e.n === 'incr' && step.e.d === 1 && step.e.e.n === 'id' && step.e.e.name === id ? 1
+      : step.n === 'assign' && step.op === '+=' && step.to.n === 'id' && step.to.name === id && step.e.n === 'num' && !step.e.float ? step.e.v : 0
+    if (by < 1 || by > 4096) return
     let touched = false, jumps = false, size = 0
     walk(s.body, x => {
       size++
@@ -1521,9 +1545,9 @@ class Unit {
 
     if (a.k !== undefined && b.k !== undefined) {
       if (a.k >= b.k) return []
-      if (b.k - a.k <= 8 && !jumps && size <= 80) {      // unrolled, with the counter a constant in each copy
+      if ((b.k - a.k) / by <= 8 && !jumps && size <= 80) {      // unrolled, with the counter a constant in each copy
         const c: Code = []
-        for (let k = a.k; k < b.k; k++) {
+        for (let k = a.k; k < b.k; k += by) {
           this.scopes.push(new Map([[id, { p: 'const', t, ks: [k], o: 0 } as Place]]))
           c.push(...this.block(s.body))
           this.scopes.pop()
@@ -1543,9 +1567,9 @@ class Unit {
     this.loops.pop()
     const guard = a.k !== undefined && b.k !== undefined ? [] : [...test, 0x45, 0x0d, 0]
     const start = [...scaled].flatMap(([sz, l]) => [...(a.k !== undefined ? i32const(a.k * sz) : [...localGet(i), ...i32const(sz), 0x6c]), ...localSet(l)])
-    const advance = [...scaled].flatMap(([sz, l]) => [...localGet(l), ...i32const(sz), 0x6a, ...localSet(l)])
+    const advance = [...scaled].flatMap(([sz, l]) => [...localGet(l), ...i32const(sz * by), 0x6a, ...localSet(l)])
     return [...a.c, ...localSet(i), ...start, ...once, 0x02, 0x40, ...guard, 0x03, 0x40, ...(cont ? [0x02, 0x40, ...body, 0x0b] : body),
-      ...localGet(i), 0x41, 1, 0x6a, ...localSet(i), ...advance, ...test, 0x0d, 0, 0x0b, 0x0b]
+      ...localGet(i), ...i32const(by), 0x6a, ...localSet(i), ...advance, ...test, 0x0d, 0, 0x0b, 0x0b]
   }
 
   // ---- output
@@ -1627,7 +1651,7 @@ class Unit {
       if (d.n === 'fn') { this.fn(d).exp = d.name; this.glue.exports.push({ name: d.name, kind: 'function', wrap: this.wrapper(d) }); continue }
       if (d.n !== 'var') continue
       const info = this.P.varInfo(d), at = { file: entry.file, pos: d.pos }
-      if (info.bytes !== undefined && d.isConst) this.glue.exports.push({ name: d.name, kind: 'view', ctor: info.t.ctor, addr: this.addr(d), length: info.ks![1] })
+      if (info.bytes !== undefined && d.isConst) this.glue.exports.push({ name: d.name, kind: 'view', ctor: info.t.ctor!, addr: this.addr(d), length: info.ks![1] })
       else if (info.ks && d.isConst && info.t.flat.length <= 1 && info.t.kind !== 'fn') this.glue.exports.push({ name: d.name, kind: 'value', value: info.ks[0] })
       else fail(`'${d.name}' cannot be exported to JavaScript: export a constant, a typed array of fixed size, or a function that returns it`, at)
     }

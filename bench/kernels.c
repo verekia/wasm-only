@@ -1,4 +1,4 @@
-// The same kernels as kernels.nib. Built with: clang --target=wasm32 -O3 -msimd128 -nostdlib
+// The same kernels as kernels.ts. Built with: clang --target=wasm32 -O3 -msimd128 -nostdlib
 
 #define EXPORT(name) __attribute__((export_name(#name))) name
 typedef unsigned int u32;
@@ -115,6 +115,23 @@ float EXPORT(particles)(int steps) {
   return checksum();
 }
 
+// What JavaScript does with a Float32Array: compute in double, round on the store.
+double EXPORT(particles_f64)(int steps) {
+  reset();
+  for (int s = 0; s < steps; s++) {
+    for (int i = 0; i < COUNT; i++) {
+      double vx = ((double)VX[i] - (double)X[i] * 0.05) * 0.999, vy = ((double)VY[i] - (double)Y[i] * 0.05) * 0.999;
+      VX[i] = (float)vx;
+      VY[i] = (float)vy;
+      X[i] = (float)((double)X[i] + vx * 0.016);
+      Y[i] = (float)((double)Y[i] + vy * 0.016);
+    }
+  }
+  double sum = 0;
+  for (int i = 0; i < COUNT; i++) sum += (double)X[i] + (double)Y[i];
+  return sum;
+}
+
 // ---- 4x4 matrix products
 
 static float ma[16], mb[16];
@@ -135,6 +152,28 @@ float EXPORT(mat4)(int n) {
   float s[4];
   for (int r = 0; r < 4; r++) s[r] = ma[r] + ma[4 + r] + ma[8 + r] + ma[12 + r];
   return s[0] + s[1] + s[2] + s[3];
+}
+
+static double da[16], db[16];
+
+double EXPORT(mat4_f64)(int n) {
+  static const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+  static const float turn[16] = {0.8f, 0.6f, 0, 0, -0.6f, 0.8f, 0, 0, 0, 0, 1, 0, 0.001f, 0.002f, 0.003f, 1};
+  for (int i = 0; i < 16; i++) { da[i] = identity[i]; db[i] = turn[i]; }
+  for (int i = 0; i < n; i++) {
+    double a11 = da[0], a21 = da[1], a31 = da[2], a41 = da[3], a12 = da[4], a22 = da[5], a32 = da[6], a42 = da[7];
+    double a13 = da[8], a23 = da[9], a33 = da[10], a43 = da[11], a14 = da[12], a24 = da[13], a34 = da[14], a44 = da[15];
+    for (int j = 0; j < 16; j += 4) {
+      double b1 = db[j], b2 = db[j + 1], b3 = db[j + 2], b4 = db[j + 3];
+      da[j] = a11 * b1 + a12 * b2 + a13 * b3 + a14 * b4;
+      da[j + 1] = a21 * b1 + a22 * b2 + a23 * b3 + a24 * b4;
+      da[j + 2] = a31 * b1 + a32 * b2 + a33 * b3 + a34 * b4;
+      da[j + 3] = a41 * b1 + a42 * b2 + a43 * b3 + a44 * b4;
+    }
+  }
+  double sum = 0;
+  for (int i = 0; i < 16; i++) sum += da[i];
+  return sum;
 }
 
 // ---- sieve
