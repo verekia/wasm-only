@@ -8,13 +8,16 @@ with `tsc`, it runs as plain JavaScript, and it means the same thing both ways.
 |---|---|
 | ![A lit cube with speed, light and colour controls](docs/cube.png) | ![A small arcade game drawn with instanced cubes](docs/game.png) |
 | [`examples/cube`](examples/cube): a Lambert-lit cube with DOM controls | [`examples/game`](examples/game): game loop, input, entity arrays, instancing |
+| ![A crowd of animated figures](docs/crowd.png) | |
+| [`examples/crowd`](examples/crowd): skinned characters, every skeleton posed in Wasm | |
 
 | Shipped | Wasm | Bindings module | HTML |
 |---|---|---|---|
 | Cube | 4.01 kB (1.51 kB brotli) | 3.28 kB (1.34 kB) | 0.74 kB |
 | Game | 8.28 kB (3.18 kB brotli) | 4.86 kB (1.75 kB) | 0.66 kB |
+| Crowd | 10.07 kB (4.32 kB brotli) | 5.60 kB (1.90 kB) | 0.76 kB |
 
-Both run under `Content-Security-Policy: default-src 'self'; script-src 'self' 'wasm-unsafe-eval'`.
+All three run under `Content-Security-Policy: default-src 'self'; script-src 'self' 'wasm-unsafe-eval'`.
 
 ## Run it
 
@@ -82,7 +85,10 @@ export function update(dt: number, steps: i32): void {
 - **Functions**, function-typed variables and parameters, and arrow functions that capture
   nothing. Small functions are inlined; `/** @inline */` forces it. Short loops with constant
   bounds are unrolled.
-- **`f32x4`** is four float32 lanes in one SIMD register.
+- **`f32x4`** is four float32 lanes in one SIMD register: arithmetic, `min`, `max`, `sqrt`, and
+  `shuffle` to pick lanes.
+- **`compiled`**, from `nib`, is `true` in Wasm and `false` in JavaScript. The branch not taken is
+  not compiled, so one file can hold a path for each.
 - **Modules.** Relative imports, `nib/*`, and text files. Top-level code runs at startup, in
   import order, except what the compiler could already compute.
 
@@ -110,6 +116,22 @@ pass = encoder.beginRenderPass({ colorAttachments: [{ view, resolveTarget: conte
 A typed array passed to JavaScript arrives as a view of the module's memory, so
 `queue.writeBuffer(buffer, 0, vertices)` uploads with no copy on the Wasm side. A Nib function
 passed to JavaScript is a callback.
+
+Data comes in the other way through JavaScript's own arrays. `new Float32Array(n)` is memory;
+`new Float32Array(buffer, offset, length)`, over a fetched file for example, is a JavaScript
+value, and `set` copies it in:
+
+```ts
+let frames: Float32Array = new Float32Array(0)
+
+export function load(file: ArrayBuffer, count: i32): void {
+  frames = new Float32Array(count)                       // memory
+  frames.set(new Float32Array(file, 64, count))          // (a,b,c,d,e)=>V$(Float32Array,a,b).set(new Float32Array(c,d,e))
+}
+```
+
+A typed array method that Nib does not compile itself (`join`, `indexOf`, `sort`) is
+JavaScript's, called on the view.
 
 The arrows go into a table in the generated module, and the Wasm imports from it by position.
 The table's name is a hash of its contents, so a module cannot link against a table from
@@ -146,7 +168,7 @@ that no fast integer can hold.
 
 ## The library
 
-Plain TypeScript in [`lib/`](lib), about 330 lines. It runs uncompiled too.
+Plain TypeScript in [`lib/`](lib), about 690 lines. It runs uncompiled too.
 
 | | |
 |---|---|
@@ -155,6 +177,7 @@ Plain TypeScript in [`lib/`](lib), about 330 lines. It runs uncompiled too.
 | `nib/input` | Keys mapped to action bits, `held(LEFT)` and `hit(JUMP)`, the pointer |
 | `nib/loop` | `loopStart(update, render)`: a fixed 120 Hz update with interpolated drawing |
 | `nib/gpu` | `gpuStart(canvas, ready, failed)`, `gpuFit()`, `gpuBuffer(data, usage)` |
+| `nib/skin` | Skeletal animation for crowds: `skinRig(file)`, `skinSpawn(rig)`, `skinPlay(i, clip, fade)`, `skinUpdate(dt)`, `skinMatrices()` |
 
 There are no DOM or WebGPU bindings to maintain: the examples call both directly, typed by
 `lib.dom.d.ts` and `@webgpu/types`.
@@ -190,6 +213,37 @@ every kernel. Chromium 158, milliseconds per call, best of 7:
 
 Bun (JavaScriptCore) and Node (V8 12.4) give the same picture; `bun run bench` prints both.
 
+### Posing a crowd
+
+[`lib/skin.ts`](lib/skin.ts) keeps rigs, clips and characters in flat arrays. `skinUpdate(dt)`
+advances every character, samples its clip (two while one fades into the next), walks the
+skeleton and writes one skin matrix a joint into one array, which the page uploads as it is.
+The file holds the loop twice: with numbers, and with `f32x4`. `compiled` picks between them.
+
+1,000 characters, microseconds a frame, best of 15 (`bench/skin.html`). One character in four
+is between two clips.
+
+| Chromium 158 | joints | plain JS | Nib, numbers | Nib, `f32x4` | JS / `f32x4` |
+|---|---|---|---|---|---|
+| The figure of boxes in `examples/crowd` | 11,000 | 740 | 585 | 180 | 4.1 |
+| Two game characters, 24 and 26 joints | 25,000 | 1,640 | 1,330 | 415 | 4.0 |
+
+| Two game characters | plain JS | Nib, numbers | Nib, `f32x4` | JS / `f32x4` |
+|---|---|---|---|---|
+| Node 22 (V8 12.4) | 2,060 | 1,390 | 446 | 4.6 |
+| Bun 1.4 (JavaScriptCore) | 1,418 | 1,405 | 466 | 3.0 |
+
+- That is 17 ns a joint. A crowd of 1,000 costs 0.4 ms of a 16.7 ms frame; the example page
+  shows the same figure live, and 1.9 ms with `?js`.
+- Compiled and plain give the same bits, on both paths. The two paths differ from each other
+  by less than 1e-5, because one rounds to float32 at every step and the other at the end.
+- The layout does most of the work before the compiler does any: the plain JavaScript column
+  is already this file, with no objects. Compiling the number path gains 1.0× to 1.5×. The
+  rest comes from four lanes.
+- [`examples/crowd/convert.ts`](examples/crowd/convert.ts) turns a skinned mesh of a glTF
+  binary and its clips into a `.rig` file, which `skinRig` copies into memory without parsing:
+  `bun examples/crowd/convert.ts model.glb hero.rig --mesh Body`.
+
 ### Calling the DOM from Wasm
 
 Three ways to bind the same DOM members, nanoseconds per call, Chromium 158
@@ -209,7 +263,8 @@ Setters and layout-dependent getters cost 215–250 ns under every scheme.
 |---|---|
 | The cube: 360 lines with the library it imports | 4.4 ms |
 | The game: 740 lines with the library it imports | 10 ms |
-| `nib build examples`, both sites, from a cold start | about 100 ms |
+| The crowd: 900 lines with the library it imports | 12 ms |
+| `nib build examples`, all three sites, from a cold start | about 200 ms |
 
 The compiler is one pass from syntax tree to bytes, about 2,300 lines of TypeScript with no
 dependencies.
@@ -223,6 +278,10 @@ dependencies.
   garbage collector and no `free`.
 - Exported functions take numbers, booleans, JavaScript values and value objects; they cannot
   take a typed array or a function from JavaScript.
+- `nib/skin` plays one clip a character and fades from the one before: no layers, no additive
+  clips, no inverse kinematics. Clips are sampled at a fixed rate when the `.rig` is made, and
+  frames are blended in a straight line. The example bends the mesh in the vertex shader from
+  a storage buffer, which needs WebGPU.
 - Verified in Chromium 158 with WebGPU on a software adapter, compiled and uncompiled,
   including keyboard and pointer play and the strict policy above. Everything without a DOM
   also runs in Bun and Node. Not yet run in Firefox or Safari, or on a real GPU or touch screen.
@@ -231,8 +290,8 @@ dependencies.
 
 ```
 nib/        syntax.ts (parser)   compiler.ts (checker, emitter)   loader.ts   cli.ts
-lib/        index.ts   math.ts   input.ts   loop.ts   gpu.ts
-examples/   cube/   game/   shared/cube.ts
-bench/      kernels.ts   kernels.c   boundary.ts   harness.js   run.ts   *.html
+lib/        index.ts   math.ts   input.ts   loop.ts   gpu.ts   skin.ts
+examples/   cube/   game/   crowd/ (main.ts, rig.ts, convert.ts)   shared/cube.ts
+bench/      kernels.ts   kernels.c   boundary.ts   harness.js   skin.js   run.ts   *.html
 test/       compiler.test.ts
 ```

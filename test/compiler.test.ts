@@ -429,6 +429,115 @@ test('modules, the library, text imports and startup order', async () => {
   expect(out.files.map(f => f.replace(/.*\/(lib|\d+)\//, '$1/'))).toContain('lib/math.ts')
 })
 
+test('f32x4.shuffle, a float into four lanes, and `compiled`', async () => {
+  const { wasm, js } = await both(`
+    import { compiled, f32x4 } from 'nib'
+    const a = new Float32Array([1, 2, 3, 4, 5, 6, 7, 8]), out = new Float32Array(12)
+    export function run(i: number): Float32Array {
+      const x = f32x4.load(a, 0), y = f32x4.load(a, 4)
+      f32x4.store(out, 0, f32x4.shuffle(x, y, 3, 0, 6, 5))
+      f32x4.store(out, 4, f32x4.shuffle(x, x, 2, 2, 2, 2))
+      f32x4.store(out, 8, f32x4.mul(f32x4.splat(a[i + 1]), x))
+      return out
+    }
+    export function where(): number { return compiled ? 1 : 2 }
+    export function branch(): number { if (compiled) return 10; return 20 }
+  `)
+  for (const m of [wasm, js]) expect([...m.run(4)]).toEqual([4, 1, 7, 6, 3, 3, 3, 3, 6, 12, 18, 24])
+  expect([wasm.where(), wasm.branch(), js.where(), js.branch()]).toEqual([1, 10, 2, 20])
+})
+
+test('memory and JavaScript arrays: views of a buffer, copies in, methods that are JavaScript\'s', async () => {
+  const g = globalThis as any
+  g.host = { base: 5, add(a: number, b: number) { return this.base + a + b }, part: { of: { scale(x: number) { return x * 2 } } } }
+  const file = new ArrayBuffer(24)
+  new Int32Array(file, 0, 2).set([7, 4])
+  new Float32Array(file, 8, 4).set([1.5, 2.5, -3, 8])
+  await same(`
+    import type { i32 } from 'nib'
+    declare const host: any
+    let store: Float32Array = new Float32Array(0)
+    const seen: number[] = []
+    let calls = 0
+    function next(): i32 { return ++calls }
+    function more(a: Float32Array, n: i32): Float32Array {
+      if (n <= a.length) return a
+      const b = new Float32Array(Math.max(n, a.length * 2))
+      b.set(a)
+      return b
+    }
+    export function load(file: ArrayBuffer): number {
+      const head = new Int32Array(file, 0, 2), n: i32 = head[1]
+      store = more(store, n + 2)
+      store.set(new Float32Array(file, 8, n), 2)
+      seen.push(n, head[0] as number)
+      return store[2] + store[n + 1] + store.length * 100 + seen.length * 1000 + new Uint8Array(file).length * 10000
+    }
+    export function text(x: number, k: i32): string { return x.toFixed(2) + '|' + k.toString(16) + '|' + store.join('/') + '|' + store.indexOf(2.5) + '|' + seen.join() }
+    export function receiver(): number { return host.add(next(), 1) * 100 + host.part.of.scale(next()) }
+    export function copy(): Float32Array { store.subarray(0, 2).set([9, 10]); return store }
+  `, [['load', file], ['load', file], ['text', Math.PI, 255], ['receiver'], ['copy']])
+})
+
+test('nib/skin: the same matrices compiled and plain, and the right ones', async () => {
+  const { dummyRig, FRAME_FLOATS } = await import('../examples/crowd/rig.ts')
+  const read = (p: string) => readFileSync(p, 'utf8'), lib = `${import.meta.dir}/../lib`
+  const out = compile(`${lib}/skin.ts`, { read, lib })
+  const wasm = instantiate(out.wasm, out.glue), js = await import('../lib/skin.ts')
+  const file = dummyRig().buffer
+
+  const run = (m: any, update: string, steps: number) => {
+    m.skinClear()
+    for (let i = 0; i < 12; i++) {
+      const c = m.skinSpawn(0)
+      m.skinPlace(c, i * 2, -i, 0.5, i * 0.7, 1 + i * 0.1)
+      m.skinPlay(c, i % 4, 0)
+      m.skinSeek(c, i * 0.37)
+      if (i % 3 === 0) m.skinPlay(c, (i + 1) % 4, 0.4)             // fading from one clip to the next
+      m.skinSpeed(c, 0.5 + i * 0.2)
+    }
+    for (let s = 0; s < steps; s++) m[update](1 / 60)
+    return [...m.skinMatrices()]
+  }
+  for (const m of [wasm, js]) expect([m.skinRig(file), m.skinRigJoints(0), m.skinRigClips(0), m.skinClipLoops(0, 1), m.rigClipNames(file)]).toEqual([0, 11, 4, true, ['Idle', 'Walk', 'Run', 'Wave']])
+  const scalar = run(wasm, 'skinUpdateScalar', 45), simd = run(wasm, 'skinUpdateSimd', 45)
+  expect(scalar.length).toBe(12 * 11 * 16)
+  expect(run(js, 'skinUpdateScalar', 45)).toEqual(scalar)
+  expect(run(js, 'skinUpdateSimd', 45)).toEqual(simd)
+  expect(run(wasm, 'skinUpdate', 45)).toEqual(simd)                // compiled, the short name is the fast path
+  expect(run(js, 'skinUpdate', 45)).toEqual(scalar)                // and plain, the one that is fast as JavaScript
+  expect(Math.max(...scalar.map((x, i) => Math.abs(x - simd[i])))).toBeLessThan(1e-4)
+
+  // against the definition, in doubles: one character, half way between two frames of Walk
+  const head = new Int32Array(file, 0, 16), J = head[1], C = head[2]
+  const parent = new Int32Array(file, 64, J), bind = new Float32Array(file, 64 + J * 4, J * 16)
+  const first = new Int32Array(file, 64 + J * 68, C), frames = new Float32Array(file, 64 + J * 68 + C * 16, head[3] * J * FRAME_FLOATS)
+  const mul = (a: number[], b: number[]) => Array.from({ length: 16 }, (_, i) => a[i % 4] * b[i - i % 4] + a[4 + i % 4] * b[i - i % 4 + 1] + a[8 + i % 4] * b[i - i % 4 + 2] + a[12 + i % 4] * b[i - i % 4 + 3])
+  const world: number[][] = [], expected: number[] = []
+  for (let j = 0; j < J; j++) {
+    const at = (f: number) => (first[1] + f) * J * FRAME_FLOATS + j * FRAME_FLOATS
+    const v = Array.from({ length: 12 }, (_, i) => (frames[at(4) + i] + frames[at(5) + i]) / 2)
+    const l = Math.hypot(v[4], v[5], v[6], v[7]), [x, y, z, w] = [v[4] / l, v[5] / l, v[6] / l, v[7] / l]
+    const local = [
+      (1 - 2 * (y * y + z * z)) * v[8], 2 * (x * y + w * z) * v[8], 2 * (x * z - w * y) * v[8], 0,
+      2 * (x * y - w * z) * v[9], (1 - 2 * (x * x + z * z)) * v[9], 2 * (y * z + w * x) * v[9], 0,
+      2 * (x * z + w * y) * v[10], 2 * (y * z - w * x) * v[10], (1 - 2 * (x * x + y * y)) * v[10], 0,
+      v[0], v[1], v[2], 1]
+    world.push(parent[j] < 0 ? mul([0, 2, 0, 0, -2, 0, 0, 0, 0, 0, 2, 0, 3, 4, 5, 1], local) : mul(world[parent[j]], local))       // a quarter turn, twice the size, at (3, 4, 5)
+    expected.push(...mul(world[j], [...bind.subarray(j * 16, j * 16 + 16)]))
+  }
+  for (const m of [wasm, js]) for (const update of ['skinUpdateScalar', 'skinUpdateSimd']) {
+    m.skinClear()
+    const c = m.skinSpawn(0)
+    m.skinPlace(c, 3, 4, 5, Math.PI / 2, 2)
+    m.skinPlay(c, 1, 0)
+    m.skinSeek(c, 4.5 / 16)                                         // Walk: 16 frames a second
+    m[update](0)
+    const got = [...m.skinMatrices()]
+    expect(Math.max(...got.map((x, i) => Math.abs(x - expected[i])))).toBeLessThan(2e-5)
+  }
+})
+
 test('errors point at the source', () => {
   expect(fails('export function a(): i32 { return 1.5 }')).toContain('main.ts:1:35: expected i32, found number: write `| 0` to truncate')
   expect(fails('export function a(x: number): i32 { return x }')).toContain('expected i32, found number')

@@ -808,12 +808,14 @@ class Unit {
   private jsMember(obj: Js, n: any): Js {
     return jsJoin([jsWrap(obj, 19), n.opt ? '?.' : '.', n.name], 19, true)
   }
-  private jsCall(callee: Js, args: any[], n: any, isNew = false): Js {
+  /** `method` is the member being called on `callee`: it stays in the call, so the method keeps its receiver. */
+  private jsCall(callee: Js, args: any[], n: any, isNew = false, method?: any): Js {
     const parts = this.ordered([callee, ...args.map(a => this.js(this.expr(a), a))], n)
+    if (method) parts[0] = this.jsMember(parts[0], method)
     const text: (string | Js)[] = [isNew ? 'new ' : '', jsWrap(parts[0], 19), n.opt ? '?.(' : '(']
     parts.slice(1).forEach((p, i) => text.push(i ? ',' : '', jsWrap(p, 2)))
     const out = jsJoin([...text, ')'], 19, true)
-    out.pure = /^Math\.\w+$/.test(callee.src.join('')) && out.pure
+    out.pure = /^Math\.\w+$/.test(parts[0].src.join('')) && out.pure
     return out
   }
   private jsBinary(op: string, a: Val, b: Val, n: any): Js {
@@ -854,6 +856,7 @@ class Unit {
           return this.lazy({ ...jsText(n.name), pure: n.name === 'Math' })                 // a JavaScript global
         }
         if (r.text !== undefined) return this.literal(r.text)
+        if (r.intrinsic === 'compiled') return this.kval(T.bool, true)
         if (r.intrinsic) return this.err(`'${n.name}' is not a value: call it, or use its methods`, n)
         if (r.d.n === 'fn') return { t: FNREF, c: [], fn: r.d, pure: true }
         if (r.d.n === 'var') return this.global(r.d)
@@ -912,7 +915,7 @@ class Unit {
       case 'new': return this.construct(n)
       case 'cond': return this.ternary(n, want)
       case 'obj': return want?.kind === 'struct' ? this.structLiteral(n, want) : this.lazy(this.jsObject(n))
-      case 'arr': return this.lazy(jsJoin(['[', ...this.ordered(n.items.map((e: any) => jsWrap(this.js(this.expr(e), e), 3)), n).flatMap((p, i) => i ? [',', p] : [p]), ']'], 20))
+      case 'arr': return this.lazy({ ...jsJoin(['[', ...this.ordered(n.items.map((e: any) => jsWrap(this.js(this.expr(e), e), 3)), n).flatMap((p, i) => i ? [',', p] : [p]), ']'], 20), pure: false })
       case 'arrow': return { t: FNREF, c: [], fn: this.liftArrow(n, want), pure: true }
     }
     return this.err('expected an expression', n)
@@ -977,7 +980,7 @@ class Unit {
     const vals = this.ordered(n.props.map(([, e]: [string, any]) => jsWrap(this.js(this.expr(e), e), 3)), n)
     const parts: (string | Js)[] = ['{']
     n.props.forEach(([k]: [string], i: number) => parts.push(i ? ',' : '', /^[A-Za-z_$][\w$]*$/.test(k) ? k : JSON.stringify(k), ':', vals[i]))
-    return { ...jsJoin([...parts, '}'], 20), object: true }
+    return { ...jsJoin([...parts, '}'], 20), object: true, pure: false }     // a new object each time
   }
 
   private binary(n: any): Val {
@@ -1139,8 +1142,8 @@ class Unit {
       const r = this.ref(f.e)
       if (r.t.kind === 'array') return this.arrayMethod(r, f.name, n)
       const o = isPlace(r) ? this.load(r) : r
-      if (!isJs(o.t)) this.err(`${o.t.name} has no method '${f.name}'`, n)
-      return this.lazy(this.jsCall(this.jsMember(this.js(o, f), f), n.args, n))
+      if (!isJs(o.t) && !isNum(o.t)) this.err(`${o.t.name} has no method '${f.name}'`, n)       // x.toFixed(2) is JavaScript's
+      return this.lazy(this.jsCall(this.js(o, f), n.args, n, false, f))
     }
     return this.callValue(this.expr(f), n)
   }
@@ -1321,6 +1324,10 @@ class Unit {
     }
     if (fn === 'splat') {
       need(1)
+      if (a[0].n === 'idx') {                               // one float from memory into all four lanes is a single instruction
+        const pl = this.ref(a[0])
+        if (isPlace(pl) && pl.p === 'mem' && pl.t === T.f32) return { t: T.f32x4, c: [...(pl.pre ?? []), ...pl.base.c, ...simd(0x09), 2, ...uleb(pl.off)] }
+      }
       const v = this.single(a[0])
       return v.k !== undefined ? this.kval(T.f32x4, [v.k, v.k, v.k, v.k]) : { t: T.f32x4, c: [...v.c, ...simd(0x13)], pure: v.pure }
     }
@@ -1329,6 +1336,12 @@ class Unit {
       need(3)
       const pl = lanes(0) as Place & { p: 'mem' }, v = vec(2)
       return { t: VOID, c: [...(pl.pre ?? []), ...pl.base.c, ...v.c, 0xfd, 0x0b, 2, ...uleb(pl.off)] }
+    }
+    if (fn === 'shuffle') {                                 // lanes 0-3 are `a`, 4-7 are `b`
+      need(6)
+      const x = vec(0), y = vec(1), pick = [2, 3, 4, 5].map(i => Number(this.P.evalConst(a[i], this.mod, T.i32).ks[0]))
+      if (pick.some(i => i < 0 || i > 7)) this.err('f32x4.shuffle picks lanes 0 to 7', n)
+      return { t: T.f32x4, c: [...x.c, ...y.c, ...simd(0x0d), ...pick.flatMap(i => [i * 4, i * 4 + 1, i * 4 + 2, i * 4 + 3])], pure: x.pure && y.pure }
     }
     if (fn in VEC_BINARY) { need(2); const x = vec(0), y = vec(1); return { t: T.f32x4, c: [...x.c, ...y.c, ...simd(VEC_BINARY[fn])], pure: x.pure && y.pure } }
     if (fn in VEC_UNARY) { need(1); const x = vec(0); return { t: T.f32x4, c: [...x.c, ...simd(VEC_UNARY[fn])], pure: x.pure } }
@@ -1352,6 +1365,7 @@ class Unit {
       }
       case 'set': {
         const src = this.ref(a[0])
+        if (isJs(src.t)) break                             // from a JavaScript array: JavaScript copies it in
         if (src.t !== arr.t) this.err(`set() needs another ${arr.t.name}, found ${src.t.name}`, n)
         const [once, sp, sl] = this.span(src), at = a.length > 1 ? int(1) : this.kval(T.i32, 0)
         return { t: VOID, c: [...pre, ...once, ...add(ptr, bytes(at)).c, ...sp.c, ...bytes(sl).c, 0xfc, 0x0a, 0, 0] }
@@ -1374,16 +1388,20 @@ class Unit {
           ...localGet(p), ...value.c, ...storeOp(el), ...memarg(el, 0), ...localGet(p), ...i32const(size), 0x6a, ...localSet(p), 0x0c, 0, 0x0b, 0x0b] }
       }
     }
-    return this.err(`${arr.t.name}.${fn}() is not supported`, n)
+    // anything else is the JavaScript method, called on a view of the memory
+    return this.lazy(this.jsCall(this.js(isPlace(arr) ? this.load(arr) : arr, n), a, n, false, n.f))
   }
 
   private construct(n: any): Val {
     const array = n.f.n === 'id' && !this.local(n.f.name) && !this.P.resolve(this.mod, n.f.name) ? ARRAYS[n.f.name] : undefined
-    if (!array) {
+    // Memory when the one argument is a number or a list. Given a buffer, or anything else of JavaScript's, it is JavaScript's own array.
+    const given = array && n.args.length === 1 && n.args[0].n !== 'arr' ? this.expr(n.args[0]) : undefined
+    const foreign = given && (given.t === T.ext || (given.t === HOST && !(given.js!.gives && isNum(given.js!.gives))))
+    if (!array || n.args.length > 1 || foreign) {
       const callee = n.f.n === 'id' && !this.local(n.f.name) && !this.P.resolve(this.mod, n.f.name) ? jsText(n.f.name) : this.js(this.expr(n.f), n)
       return this.lazy({ ...this.jsCall(callee, n.args, n, true), prec: 19, pure: false })
     }
-    if (n.args.length !== 1) this.err(`new ${array.name}(length) or new ${array.name}([values])`, n)
+    if (n.args.length !== 1) this.err(`new ${array.name}(length), new ${array.name}([values]) or new ${array.name}(buffer, offset, length)`, n)
     const el = array.el!, len = this.local$(T.i32), ptr = this.local$(T.i32)
     if (n.args[0].n === 'arr') {
       const items = n.args[0].items as any[]

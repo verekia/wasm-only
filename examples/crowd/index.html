@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Nib: a skinned crowd</title>
+<link rel="stylesheet" href="../cube/style.css">
+<canvas id="view"></canvas>
+<div id="status"></div>
+<aside>
+  <h1>Nib</h1>
+  <p>Skeletons posed in <span id="mode">…</span>.</p>
+  <p><output id="count-label">–</output> characters, <output id="joints">–</output> joints<br>
+     <output id="pose">–</output> ms to pose them, <output id="fps">–</output> fps</p>
+  <label>Crowd <input id="count" type="range" min="50" max="4000" step="50" value="500"></label>
+</aside>
+<script type="module" src="main.ts"></script>
+</html>

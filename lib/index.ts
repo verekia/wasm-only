@@ -10,6 +10,9 @@ export type u32 = number
 export type f32 = number
 export type f64 = number
 
+/** True in the compiled program, false when the same file runs as JavaScript. The branch not taken is not compiled. */
+export const compiled: boolean = false
+
 const { fround, min, max, abs, sqrt } = Math
 
 /** Four float32 values that are computed together. In Wasm, one SIMD register. */
@@ -32,6 +35,11 @@ export const f32x4 = Object.assign((x: number, y: number, z: number, w: number):
   /** The four elements of `a` starting at `i`. */
   load: (a: Float32Array, i: number): f32x4 => new Lanes(a[i], a[i + 1], a[i + 2], a[i + 3]),
   store: (a: Float32Array, i: number, v: f32x4): void => { a[i] = v.x; a[i + 1] = v.y; a[i + 2] = v.z; a[i + 3] = v.w },
+  /** Four lanes picked from `a` (0 to 3) and `b` (4 to 7). The picks must be constants. */
+  shuffle: (a: f32x4, b: f32x4, i: number, j: number, k: number, l: number): f32x4 => {
+    const all = [a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w]
+    return new Lanes(all[i], all[j], all[k], all[l])
+  },
   add: each((a, b) => a + b),
   sub: each((a, b) => a - b),
   mul: each((a, b) => a * b),

@@ -3,3 +3,7 @@ node_modules/
 bench/out/
 test/.tmp/
 *.log
+# rigs converted from your own models: see examples/crowd/main.ts
+examples/crowd/*.rig
+!examples/crowd/dummy.rig
+examples/crowd/rigs.json
