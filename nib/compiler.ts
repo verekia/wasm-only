@@ -93,6 +93,7 @@ const FLOAT_FNS: Record<string, [number, number, (x: number) => number]> = {
 }
 const BIT_FNS: Record<string, number> = { clz: 0x67, ctz: 0x68, popcnt: 0x69 }
 const LANES = 'xyzw'
+const param = (i: number) => i < 26 ? String.fromCharCode(97 + i) : 'a' + i          // names for generated JS parameters
 
 function fold(op: string, t: Type, a: any, b: any): any {
   if (typeof a !== 'number' || typeof b !== 'number') return undefined
@@ -143,7 +144,7 @@ export interface Options {
 
 interface Val { t: Type; c: Code; k?: any; ks?: any[]; pure?: boolean }
 type Place = { t: Type; pre?: Code } & (
-  | { p: 'loc'; i: number }
+  | { p: 'loc'; i: number; scaled?: Map<number, number> }      // scaled: a for-loop counter's pre-multiplied copies
   | { p: 'glob'; g: Glob[]; o: number }
   | { p: 'mem'; base: Val; off: number }
   | { p: 'const'; ks: any[]; o: number })
@@ -153,7 +154,11 @@ class Program {
   decls = new Map<string, any>()
   files: string[] = []
   host?: WebAssembly.Imports
-  constructor(readonly opts: Options) {}
+  opts: Options
+  private addrs = new Map<any, number>()
+  comptime = new Map<any, { t: Type; ks: any[] }>()
+  top = 16                               // next free static address; address 0 stays unused
+  constructor(opts: Options) { this.opts = opts }
 
   load(path: string, from?: { file: File; pos: number }): void {
     if (this.files.includes(path)) return
@@ -241,6 +246,18 @@ class Program {
     return d.info = { t, ks: v.ks }
   }
 
+  /** A static's address. One address space serves every unit, so pointers computed at compile time stay valid. */
+  addr(d: any): number {
+    let a = this.addrs.get(d)
+    if (a === undefined) {
+      const s = this.staticInfo(d)
+      a = (this.top + s.el.align - 1) & -s.el.align
+      this.top = a + s.size
+      this.addrs.set(d, a)
+    }
+    return a
+  }
+
   staticInfo(d: any): { el: Type; size: number; data?: Uint8Array } {
     if (d.info) return d.info
     const el = this.type(d.el, d.file), at = { file: d.file, pos: d.pos }
@@ -289,11 +306,10 @@ class Unit {
   private globals: Glob[] = []
   private fnOf = new Map<any, Func>()
   private globOf = new Map<any, Glob[]>()
-  private addrOf = new Map<any, number>()
+  private statics = new Set<any>()
   private segs: { addr: number; bytes: Uint8Array }[] = []
   private elems = new Set<Func>()
   private queue: any[] = []
-  private top = 16                       // next free static address; address 0 stays unused
   private usesMem = false
 
   // state of the function being compiled
@@ -307,7 +323,8 @@ class Unit {
   private inl: { depth: number } | null = null
   private inlining = 0
 
-  constructor(readonly P: Program) {}
+  P: Program
+  constructor(program: Program) { this.P = program }
 
   private err(msg: string, n: any): never { return fail(msg, { file: this.file, pos: n.pos }) }
 
@@ -362,14 +379,12 @@ class Unit {
     return g
   }
   addr(d: any): number {
-    let a = this.addrOf.get(d)
-    if (a === undefined) {
-      const s = this.P.staticInfo(d)
-      a = (this.top + s.el.align - 1) & -s.el.align
-      this.top = a + s.size
-      this.addrOf.set(d, a)
+    const a = this.P.addr(d)
+    if (!this.statics.has(d)) {
+      this.statics.add(d)
       this.usesMem = true
-      if (s.data) this.segs.push({ addr: a, bytes: s.data })
+      const data = this.P.staticInfo(d).data
+      if (data) this.segs.push({ addr: a, bytes: data })
     }
     return a
   }
@@ -493,6 +508,10 @@ class Unit {
 
   // ---- expressions
 
+  private local(name: string): Place | undefined {
+    for (let i = this.scopes.length - 1; i >= 0; i--) { const p = this.scopes[i].get(name); if (p) return p }
+  }
+
   expr(n: any): Val {
     const r = this.ref(n)
     return 'p' in r ? this.load(r) : r
@@ -502,7 +521,8 @@ class Unit {
   private ref(n: any): Val | Place {
     switch (n.n) {
       case 'id': {
-        for (let i = this.scopes.length - 1; i >= 0; i--) { const p = this.scopes[i].get(n.name); if (p) return p }
+        const local = this.local(n.name)
+        if (local) return local
         const d = this.P.decls.get(n.name)
         if (!d) this.err(`unknown name '${n.name}'`, n)
         if (d.n === 'const') return { p: 'const', o: 0, ...this.P.constOf(d) }
@@ -525,8 +545,18 @@ class Unit {
           const off = i.k * el.size
           return off >= 0 ? { p: 'mem', t: el, base: b, off } : { p: 'mem', t: el, base: { t: T.i32, c: [...b.c, 0x41, ...sleb(off), 0x6a], pure: b.pure }, off: 0 }
         }
-        const shift = Math.log2(el.size)
-        const scaled = el.size === 1 ? i.c : Number.isInteger(shift) ? [...i.c, 0x41, shift, 0x74] : [...i.c, 0x41, ...sleb(el.size), 0x6c]
+        // Indexing by a for-loop counter reads a second counter that advances by the element
+        // size, instead of multiplying on every access.
+        const counter = n.i.n === 'id' && el.size > 1 ? this.local(n.i.name) : undefined
+        let scaled: Code
+        if (counter?.p === 'loc' && counter.scaled) {
+          let l = counter.scaled.get(el.size)
+          if (l === undefined) counter.scaled.set(el.size, l = this.alloc(T.i32))
+          scaled = localGet(l)
+        } else {
+          const shift = Math.log2(el.size)
+          scaled = el.size === 1 ? i.c : Number.isInteger(shift) ? [...i.c, 0x41, shift, 0x74] : [...i.c, 0x41, ...sleb(el.size), 0x6c]
+        }
         return b.k !== undefined
           ? { p: 'mem', t: el, base: { t: T.i32, c: scaled, pure: i.pure }, off: b.k }
           : { p: 'mem', t: el, base: { t: T.i32, c: [...b.c, ...scaled, 0x6a], pure: b.pure && i.pure }, off: 0 }
@@ -560,7 +590,8 @@ class Unit {
       case 'call': return this.call(n)
       case 'cond': return this.ternary(n)
       case 'comptime': {
-        const v = n.val ??= this.P.evalConst(n.e, this.file)
+        let v = this.P.comptime.get(n)                       // an inline function is compiled many times, evaluated once
+        if (!v) this.P.comptime.set(n, v = this.P.evalConst(n.e, this.file))
         return this.load({ p: 'const', o: 0, ...v })
       }
       case 'addr': {
@@ -570,21 +601,27 @@ class Unit {
         if (b.k !== undefined && !r.pre) return this.kval(t, b.k + r.off)
         return { t, c: [...(r.pre ?? []), ...b.c, ...(r.off ? [0x41, ...sleb(r.off), 0x6a] : [])], pure: b.pure && !r.pre }
       }
-      case 'obj': {               // { key: value } builds a JavaScript object
-        const o = this.alloc(T.ext)
-        const c: Code = [0x10, this.imp('fn', 'Object', [], [EXT]), 0x21, ...uleb(o)]
-        for (const [key, e] of n.props) {
-          const v = this.js(this.expr(e), e)
-          c.push(...localGet(o), ...this.str(key).c, ...v.c, 0x10, this.imp('fn', 'Reflect.set', [EXT, EXT, ...v.t.flat], []))
-        }
-        return { t: T.ext, c: [...c, ...localGet(o)] }
-      }
-      case 'arr': {               // [a, b] builds a JavaScript array
-        const vs: Val[] = n.items.map((e: any) => this.js(this.expr(e), e))
-        return { t: T.ext, c: [...vs.flatMap(v => v.c), 0x10, this.imp('fn', 'Array.of', vs.flatMap(v => v.t.flat), [EXT])] }
-      }
+      case 'obj': case 'arr': return this.literal(n)
     }
     return this.err('expected an expression', n)
+  }
+
+  /**
+   * A JavaScript object or array literal, however deeply nested, becomes one imported function
+   * that builds it in a single call. Constants are written into that function's source; only
+   * values known at run time are passed as arguments.
+   */
+  private literal(n: any): Val {
+    const args: Val[] = []
+    const emit = (e: any): string => {
+      if (e.n === 'obj') return `{${e.props.map(([k, x]: [string, any]) => `${/^[A-Za-z_$][\w$]*$/.test(k) ? k : JSON.stringify(k)}:${emit(x)}`).join()}}`
+      if (e.n === 'arr') return `[${e.items.map(emit).join()}]`
+      const v = this.js(this.expr(e), e), k = v.k
+      if (k === undefined || v.t.w === V128) return param(args.push(v) - 1)
+      return k === null ? 'null' : typeof k === 'string' ? JSON.stringify(k) : typeof k === 'bigint' ? k + 'n' : v.t === T.bool ? String(!!k) : String(k)
+    }
+    const body = emit(n)
+    return { t: T.ext, c: [...args.flatMap(v => v.c), 0x10, this.imp('js', `(${args.map((_, i) => param(i))})=>(${body})`, args.flatMap(v => v.t.flat), [EXT])] }
   }
 
   private arith(op: string, a: Val, b: Val, n: any): Val {
@@ -621,7 +658,7 @@ class Unit {
     const and = n.op === '&&', a = this.truthy(this.expr(n.a), n.a, true)
     if (a.k !== undefined) return !!a.k === and ? this.truthy(this.expr(n.b), n.b, true) : a   // the other side is never compiled
     const b = this.truthy(this.expr(n.b), n.b, true)
-    if (b.pure && b.c.length <= 12) return { t: T.bool, c: [...a.c, ...b.c, and ? 0x71 : 0x72], pure: a.pure }
+    if (b.pure && b.c.length <= 32) return { t: T.bool, c: [...a.c, ...b.c, and ? 0x71 : 0x72], pure: a.pure }    // cheap and safe: no branch
     return { t: T.bool, c: and ? [...a.c, 0x04, I32, ...b.c, 0x05, 0x41, 0, 0x0b] : [...a.c, 0x04, I32, 0x41, 1, 0x05, ...b.c, 0x0b] }
   }
 
@@ -717,8 +754,16 @@ class Unit {
     if (n.args.length < ps.length || (n.args.length > ps.length && !d.variadic))
       this.err(`${n.name}() takes ${ps.length} argument${ps.length === 1 ? '' : 's'}, found ${n.args.length}`, n)
     const vs: Val[] = n.args.map((a: any, i: number) => ps[i] ? this.coerce(this.expr(a), ps[i]!, a) : this.js(this.expr(a), a))
-    const f = this.imp(d.kind, d.path, vs.flatMap(v => v.t.flat), ret.flat)
-    return { t: ret, c: [...vs.flatMap(v => v.c), 0x10, f] }
+    // The import's name is the JavaScript it binds to: a function value, or a one-line arrow
+    // with exactly this call's arity, which the engine can inline and specialise like any other.
+    const flat = vs.flatMap(v => v.t.flat), names = flat.map((_, i) => param(i)), member = d.path.slice(d.path.lastIndexOf('.') + 1)
+    const source = d.kind === 'fn' ? d.path
+      : d.kind === 'js' ? d.source
+      : d.kind === 'new' ? `(${names})=>new ${d.path}(${names})`
+      : d.kind === 'get' ? `a=>a.${member}`
+      : d.kind === 'set' ? `(a,b)=>{a.${member}=b}`
+      : `(${names})=>a.${member}(${names.slice(1)})`
+    return { t: ret, c: [...vs.flatMap(v => v.c), 0x10, this.imp('js', source, flat, ret.flat)] }
   }
 
   /** Expands an `inline fn` in place. Constant arguments stay constant inside the body. */
@@ -791,7 +836,11 @@ class Unit {
         return { t, c: [...p1, ...p2, ...x1.c, ...y1.c, ...this.arith(max ? '>' : '<', x1, y1, n).c, 0x1b], pure: pure && !p1.length && !p2.length }
       }
       case 'sizeof': need(1); return this.kval(INT, this.P.type({ n: 'tname', name: a[0].name, pos: a[0].pos }, this.file).size)
-      case 'splat': { need(1); const v = this.coerce(this.expr(a[0]), T.f32, a[0]); return { t: T.f32x4, c: [...v.c, ...simd(0x13)], pure: v.pure } }
+      case 'splat': {
+        need(1)
+        const v = this.coerce(this.expr(a[0]), T.f32, a[0])
+        return v.k !== undefined ? this.kval(T.f32x4, [v.k, v.k, v.k, v.k]) : { t: T.f32x4, c: [...v.c, ...simd(0x13)], pure: v.pure }
+      }
       case 'f32x4': {
         const vs = this.args(n, [T.f32, T.f32, T.f32, T.f32])
         if (vs.every(v => v.k !== undefined)) return this.kval(T.f32x4, vs.map(v => v.k))
@@ -850,6 +899,7 @@ class Unit {
       case 'assign': {
         const r = this.ref(s.to)
         if (!('p' in r)) return this.err('cannot assign to this expression', s.to)
+        if (r.p === 'loc' && r.scaled) this.err('a for-loop counter cannot be assigned', s.to)
         if (s.op === '=') return this.store(r, this.coerce(this.expr(s.e), r.t, s.e), s)
         let once: Code = r.pre ?? [], pl: Place = { ...r, pre: undefined }       // read and write the same place once
         if (pl.p === 'mem') { const [c, base] = this.stable(pl.base); once = [...once, ...c]; pl = { ...pl, base } }
@@ -899,14 +949,17 @@ class Unit {
         const test = [...localGet(i), ...end.c, t.signed ? 0x48 : 0x49]
         this.loops.push({ brk: d + 1, cont: cont ? d + 3 : d + 2 })
         this.depth = d + (cont ? 3 : 2)
-        this.scopes.push(new Map([[s.name, { p: 'loc', t, i } as Place]]))
+        const scaled = new Map<number, number>()            // element size → local holding counter * size
+        this.scopes.push(new Map([[s.name, { p: 'loc', t, i, scaled } as Place]]))
         const body = this.block(s.body)
         this.scopes.pop()
         this.depth = d
         this.loops.pop()
         const guard = a.k !== undefined && b.k !== undefined ? [] : [...test, 0x45, 0x0d, 0]
-        return [...a.c, 0x21, ...uleb(i), ...once, 0x02, 0x40, ...guard, 0x03, 0x40, ...(cont ? [0x02, 0x40, ...body, 0x0b] : body),
-          ...localGet(i), 0x41, 1, 0x6a, 0x21, ...uleb(i), ...test, 0x0d, 0, 0x0b, 0x0b]
+        const init = [...scaled].flatMap(([size, l]) => [...(a.k !== undefined ? this.kval(T.i32, a.k * size).c : [...localGet(i), 0x41, ...sleb(size), 0x6c]), 0x21, ...uleb(l)])
+        const step = [...scaled].flatMap(([size, l]) => [...localGet(l), 0x41, ...sleb(size), 0x6a, 0x21, ...uleb(l)])
+        return [...a.c, 0x21, ...uleb(i), ...init, ...once, 0x02, 0x40, ...guard, 0x03, 0x40, ...(cont ? [0x02, 0x40, ...body, 0x0b] : body),
+          ...localGet(i), 0x41, 1, 0x6a, 0x21, ...uleb(i), ...step, ...test, 0x0d, 0, 0x0b, 0x0b]
       }
       case 'break': case 'continue': {
         const l = this.loops.at(-1) ?? this.err(`${s.n} outside a loop`, s)
@@ -944,17 +997,24 @@ class Unit {
   /** Wraps a value in an exported function, instantiates the module in the compiler's own engine and returns its exports. */
   run(v: Val): WebAssembly.Exports {
     this.funcs.push({ idx: 0, type: this.functype([], v.t.flat), name: '__ct', exp: '__ct', locals: this.locals, code: v.c })
-    return new WebAssembly.Instance(new WebAssembly.Module(this.finish(false)), this.P.host ??= runtime(globalThis)).exports
+    return new WebAssembly.Instance(new WebAssembly.Module(this.finish(false)), this.P.host ??= runtime()).exports
   }
 
-  finish(names: boolean): Uint8Array {
+  finish(names: boolean): Uint8Array<ArrayBuffer> {
     this.drain()
-    let i = 0
-    for (const f of this.fimports.values()) f.idx = i++
-    for (const f of this.funcs) f.idx = i++
-    i = 0
-    for (const g of this.gimports.values()) g.idx = i++
-    for (const g of this.globals) g.idx = i++
+    // Keep only what the exports can reach in the code that was actually emitted. Folding and
+    // inlining leave things behind (a string that ended up inside a literal's source, say).
+    const live = new Set<Func | Glob>(), todo: (Func | Glob)[] = this.funcs.filter(f => f.exp)
+    for (let x; (x = todo.pop());) {
+      if (live.has(x)) continue
+      live.add(x)
+      for (const y of 'w' in x ? x.init : x.code) if (typeof y !== 'number') todo.push(y)
+    }
+    const keep = <X extends Func | Glob>(xs: Iterable<X>) => [...xs].filter(x => live.has(x))
+    const fimports = keep(this.fimports.values()), funcs = keep(this.funcs), elems = keep(this.elems)
+    const gimports = keep(this.gimports.values()), globals = keep(this.globals)
+    fimports.concat(funcs).forEach((f, i) => f.idx = i)
+    gimports.concat(globals).forEach((g, i) => g.idx = i)
 
     const out: number[] = [0, 0x61, 0x73, 0x6d, 1, 0, 0, 0]
     const put = (bytes: ArrayLike<number>) => { for (let j = 0; j < bytes.length; j++) out.push(bytes[j]) }
@@ -969,18 +1029,18 @@ class Unit {
 
     section(1, this.typeDefs)
     section(2, [
-      ...[...this.fimports.values()].map(f => [...name(f.imp![0]), ...name(f.imp![1]), 0, ...uleb(f.type)]),
-      ...[...this.gimports.values()].map(g => [...name(g.imp![0]), ...name(g.imp![1]), 3, g.w, 0]),
+      ...fimports.map(f => [...name(f.imp![0]), ...name(f.imp![1]), 0, ...uleb(f.type)]),
+      ...gimports.map(g => [...name(g.imp![0]), ...name(g.imp![1]), 3, g.w, 0]),
     ])
-    section(3, this.funcs.map(f => uleb(f.type)))
-    if (mem) section(5, [[0, ...uleb(Math.ceil(this.top / 65536))]])
-    section(6, this.globals.map(g => [g.w, +g.mut, ...resolve(g.init), 0x0b]))
+    section(3, funcs.map(f => uleb(f.type)))
+    if (mem) section(5, [[0, ...uleb(Math.ceil(this.P.top / 65536))]])
+    section(6, globals.map(g => [g.w, +g.mut, ...resolve(g.init), 0x0b]))
     section(7, [
       ...(mem ? [[...name('memory'), 2, 0]] : []),
-      ...this.funcs.filter(f => f.exp).map(f => [...name(f.exp!), 0, ...uleb(f.idx)]),
+      ...funcs.filter(f => f.exp).map(f => [...name(f.exp!), 0, ...uleb(f.idx)]),
     ])
-    if (this.elems.size) section(9, [[3, 0, ...uleb(this.elems.size), ...[...this.elems].flatMap(f => uleb(f.idx))]])   // declares ref.func targets
-    section(10, this.funcs.map(f => {
+    if (elems.length) section(9, [[3, 0, ...uleb(elems.length), ...elems.flatMap(f => uleb(f.idx))]])   // declares ref.func targets
+    section(10, funcs.map(f => {
       const groups: number[][] = []
       for (const w of f.locals) { const g = groups.at(-1); if (g && g[1] === w) g[0]++; else groups.push([1, w]) }
       const b = [...uleb(groups.length), ...groups.flatMap(([n, w]) => [...uleb(n), w]), ...resolve(f.code), 0x0b]
@@ -988,7 +1048,7 @@ class Unit {
     }))
     section(11, this.dataSegments().map(s => [0, 0x41, ...sleb(s.addr), 0x0b, ...uleb(s.bytes.length), ...s.bytes]))
     if (names) {
-      const all = [...this.fimports.values(), ...this.funcs].map(f => [...uleb(f.idx), ...name(f.name)])
+      const all = [...fimports, ...funcs].map(f => [...uleb(f.idx), ...name(f.name)])
       const sub = [...uleb(all.length), ...all.flat()]
       const body = [...name('name'), 1, ...uleb(sub.length), ...sub]
       out.push(0); put(uleb(body.length)); put(body)
@@ -1023,7 +1083,7 @@ function hasContinue(body: any[]): boolean {
 
 // ---------------------------------------------------------------- entry point
 
-export interface Output { wasm: Uint8Array; files: string[] }
+export interface Output { wasm: Uint8Array<ArrayBuffer>; files: string[] }
 
 /** Compiles the program rooted at `entry`. Every `export fn` becomes a WebAssembly export. */
 export function compile(entry: string, opts: Options): Output {

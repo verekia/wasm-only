@@ -47,7 +47,7 @@ const PREC: Record<string, number> = {
   '|': 4, '^': 5, '&': 6, '<<': 7, '>>': 7, '+': 8, '-': 8, '*': 9, '/': 9, '%': 9,
 }
 const ASSIGN = new Set(['=', '+=', '-=', '*=', '/=', '%=', '&=', '|=', '^=', '<<=', '>>='])
-const EXTERN_KINDS = new Set(['fn', 'call', 'get', 'set', 'new', 'val'])
+const EXTERN_KINDS = new Set(['fn', 'call', 'get', 'set', 'new', 'val', 'js'])
 
 export function parse(file: File): { imports: { path: string; pos: number }[]; decls: any[] } {
   const toks = lex(file)
@@ -232,7 +232,14 @@ export function parse(file: File): { imports: { path: string; pos: number }[]; d
     }
     if (eat('extern')) {
       const kind = ident()
-      if (!EXTERN_KINDS.has(kind)) err(`unknown extern kind '${kind}' (expected fn, call, get, set, new or val)`)
+      if (!EXTERN_KINDS.has(kind)) err(`unknown extern kind '${kind}' (expected fn, call, get, set, new, val or js)`)
+      if (kind === 'js') {                         // extern js name(params): T = "any JavaScript expression that yields a function"
+        const name = ident(), p = params(true), ret = eat(':') ? type() : null
+        expect('=')
+        const src = toks[i++]
+        if (src.k !== 'str') err('expected the JavaScript source as a string', src)
+        return { n: 'extern', pos, name, kind, path: name, source: src.v, short: false, params: p.params, variadic: p.variadic, ret }
+      }
       let path = ident(), last = path
       while (eat('.')) path += '.' + (last = ident())
       const short = !is('('), p = short ? { params: [], variadic: false } : params(true)

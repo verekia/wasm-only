@@ -93,7 +93,7 @@ function dev(site: string, port: number) {
       }
       return existsSync(file) && statSync(file).isFile() ? new Response(Bun.file(file)) : new Response('not found', { status: 404 })
     },
-    websocket: { open: ws => ws.subscribe('reload'), message() {} },
+    websocket: { open(ws) { ws.subscribe('reload') }, message() {} },
   })
   for (const dir of [root, std]) watch(dir, { recursive: true }, () => server.publish('reload', ''))
   console.log(`nib dev  ${server.url}`)

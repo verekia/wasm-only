@@ -1,0 +1,196 @@
+// The same kernels as kernels.c, written the same way, so the two compilers can be compared.
+
+import "std/math"
+
+// ---- n-body: f64 arithmetic over structs in memory
+
+struct Body { x: f64, y: f64, z: f64, vx: f64, vy: f64, vz: f64, mass: f64 }
+static bodies: [Body; 5]
+const SOLAR = 4.0 * PI * PI
+const YEAR = 365.24
+
+fn energy(): f64 {
+  let e: f64 = 0.0
+  for i in 0..5 {
+    let a = &bodies[i]
+    e += 0.5 * a.mass * (a.vx * a.vx + a.vy * a.vy + a.vz * a.vz)
+    for j in i + 1..5 {
+      let b = &bodies[j]
+      let dx = a.x - b.x
+      let dy = a.y - b.y
+      let dz = a.z - b.z
+      e -= a.mass * b.mass / sqrt(dx * dx + dy * dy + dz * dz)
+    }
+  }
+  return e
+}
+
+export fn nbody(steps: i32): f64 {
+  bodies[0] = Body(0, 0, 0, 0, 0, 0, SOLAR)
+  bodies[1] = Body(4.84143144246472090, -1.16032004402742839, -0.103622044471123109, 0.00166007664274403694 * YEAR, 0.00769901118419740425 * YEAR, -0.0000690460016972063023 * YEAR, 0.000954791938424326609 * SOLAR)
+  bodies[2] = Body(8.34336671824457987, 4.12479856412430479, -0.403523417114321381, -0.00276742510726862411 * YEAR, 0.00499852801234917238 * YEAR, 0.0000230417297573763929 * YEAR, 0.000285885980666130812 * SOLAR)
+  bodies[3] = Body(12.8943695621391310, -15.1111514016986312, -0.223307578892655734, 0.00296460137564761618 * YEAR, 0.00237847173959480950 * YEAR, -0.0000296589568540237556 * YEAR, 0.0000436624404335156298 * SOLAR)
+  bodies[4] = Body(15.3796971148509165, -25.9193146099879641, 0.179258772950371181, 0.00268067772490389322 * YEAR, 0.00162824170038242295 * YEAR, -0.0000951592254519715870 * YEAR, 0.0000515138902046611451 * SOLAR)
+  for s in 0..steps {
+    for i in 0..5 {
+      let a = &bodies[i]
+      for j in i + 1..5 {
+        let b = &bodies[j]
+        let dx = a.x - b.x
+        let dy = a.y - b.y
+        let dz = a.z - b.z
+        let d2 = dx * dx + dy * dy + dz * dz
+        let mag = 0.01 / (d2 * sqrt(d2))
+        a.vx -= dx * b.mass * mag
+        a.vy -= dy * b.mass * mag
+        a.vz -= dz * b.mass * mag
+        b.vx += dx * a.mass * mag
+        b.vy += dy * a.mass * mag
+        b.vz += dz * a.mass * mag
+      }
+    }
+    for i in 0..5 {
+      let b = &bodies[i]
+      b.x += 0.01 * b.vx
+      b.y += 0.01 * b.vy
+      b.z += 0.01 * b.vz
+    }
+  }
+  return energy()
+}
+
+// ---- mandelbrot: a branchy f64 loop held entirely in locals
+
+export fn mandelbrot(size: i32, limit: i32): i32 {
+  let total = 0
+  let scale = 2.0 / size as f64
+  for py in 0..size {
+    let ci = py as f64 * scale - 1.0
+    for px in 0..size {
+      let cr = px as f64 * scale - 1.5
+      let zr: f64 = 0.0
+      let zi: f64 = 0.0
+      let i = 0
+      while i < limit && zr * zr + zi * zi <= 4.0 {
+        let t = zr * zr - zi * zi + cr
+        zi = 2.0 * zr * zi + ci
+        zr = t
+        i += 1
+      }
+      total += i
+    }
+  }
+  return total
+}
+
+// ---- particles on springs: f32 arrays, the shape of most game update loops
+
+const COUNT = 4096
+static px: [f32x4; COUNT / 4]
+static py: [f32x4; COUNT / 4]
+static vx: [f32x4; COUNT / 4]
+static vy: [f32x4; COUNT / 4]
+const X = px as *f32
+const Y = py as *f32
+const VX = vx as *f32
+const VY = vy as *f32
+
+fn reset(): f32 {
+  for i in 0..COUNT {
+    X[i] = (i & 63) as f32 * 0.1 - 3.0
+    Y[i] = (i >> 6) as f32 * 0.1 - 3.0
+    VX[i] = 0
+    VY[i] = 0
+  }
+  return 0
+}
+fn checksum(): f32 {
+  let sum: f32 = 0
+  for i in 0..COUNT { sum += X[i] + Y[i] }
+  return sum
+}
+
+// written element by element, exactly like the C
+export fn particles(steps: i32): f32 {
+  reset()
+  for s in 0..steps {
+    for i in 0..COUNT {
+      VX[i] = (VX[i] - X[i] * 0.05) * 0.999
+      VY[i] = (VY[i] - Y[i] * 0.05) * 0.999
+      X[i] += VX[i] * 0.016
+      Y[i] += VY[i] * 0.016
+    }
+  }
+  return checksum()
+}
+
+// the same update, four particles at a time, reading each position once
+export fn particles_simd(steps: i32): f32 {
+  reset()
+  for s in 0..steps {
+    for i in 0..COUNT / 4 {
+      let x = px[i]
+      let y = py[i]
+      let u = (vx[i] - x * splat(0.05)) * splat(0.999)
+      let v = (vy[i] - y * splat(0.05)) * splat(0.999)
+      vx[i] = u
+      vy[i] = v
+      px[i] = x + u * splat(0.016)
+      py[i] = y + v * splat(0.016)
+    }
+  }
+  return checksum()
+}
+
+// ---- 4x4 matrix products
+
+static ma: [f32x4; 4]
+static mb: [f32x4; 4]
+
+export fn mat4(n: i32): f32 {
+  mat4_translation(ma, 0, 0, 0)
+  mb[0] = f32x4(0.8, 0.6, 0, 0)
+  mb[1] = f32x4(-0.6, 0.8, 0, 0)
+  mb[2] = f32x4(0, 0, 1, 0)
+  mb[3] = f32x4(0.001, 0.002, 0.003, 1)
+  for i in 0..n { mat4_mul(ma, ma, mb) }
+  let sum = ma[0] + ma[1] + ma[2] + ma[3]
+  return sum.x + sum.y + sum.z + sum.w
+}
+
+// ---- sieve: byte loads and stores with a variable stride
+
+const LIMIT = 2000000
+static flags: [u8; LIMIT]
+
+export fn sieve(n: i32): i32 {
+  memfill(flags, 1, n)
+  let count = 0
+  for i in 2..n {
+    if flags[i] != 0 {
+      count += 1
+      let j = i + i
+      while j < n {
+        flags[j] = 0
+        j += i
+      }
+    }
+  }
+  return count
+}
+
+// ---- integer mixing
+
+export fn hash(n: u32): u32 {
+  let h: u32 = 2166136261
+  for i in 0..n {
+    h = (h ^ i) * 16777619
+    h = h ^ h >> 13
+    h = (h << 7 | h >> 25) + i
+  }
+  return h
+}
+
+// ---- calls
+
+export fn fib(n: i32): i32 { return n < 2 ? n : fib(n - 1) + fib(n - 2) }

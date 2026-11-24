@@ -6,7 +6,7 @@ import { runtime } from '../nib/loader.ts'
 function run(src: string, files: Record<string, string> = {}): any {
   const all: Record<string, string> = { 'main.nib': src, ...files }
   const { wasm } = compile('main.nib', { read: p => { if (p in all) return all[p]; throw new Error('missing ' + p) }, debug: true })
-  return new WebAssembly.Instance(new WebAssembly.Module(wasm), runtime(globalThis)).exports
+  return new WebAssembly.Instance(new WebAssembly.Module(wasm), runtime()).exports
 }
 const fails = (src: string) => { try { run(src) } catch (e: any) { return e.message as string } return '' }
 
@@ -188,6 +188,49 @@ test('comptime: constants, host functions and memory snapshots', () => {
   expect(WebAssembly.Module.imports(new WebAssembly.Module(wasm))).toEqual([])
 })
 
+test('addresses computed at compile time match the final layout', () => {
+  const x = run(`
+    static pad: [i32; 7]
+    static a: [f32x4; 2]
+    static b: [u8; 3] = [1, 2, 3]
+    static links: [*u8; 2] = comptime link
+    const A = a as *f32
+    const LAST = &b[2]
+    fn link(out: **u8) { out[0] = b; out[1] = &b[1] }
+    export fn go(): f32 { pad[6] = 9; A[5] = 2.5; return a[1].y + LAST[0] as f32 + links[1][0] as f32 + (links[0] == b ? 100.0 : 0.0) }
+  `)
+  expect(x.go()).toBe(2.5 + 3 + 2 + 100)
+})
+
+test('for-loop counters index memory through a pre-scaled copy', () => {
+  const x = run(`
+    struct P { a: i32, b: f64 }
+    static xs: [i32; 8]
+    static ps: [P; 8]
+    static bytes: [u8; 8]
+    export fn go(from: i32, to: i32): f64 {
+      for i in 0..8 { xs[i] = i * 10; ps[i] = P(i, i as f64 * 0.5); bytes[i] = i }
+      let sum: f64 = 0.0
+      for i in from..to {
+        if i == 3 { continue }
+        let p = &ps[i]
+        for j in i..to { sum += (xs[j] + bytes[j] + p.a) as f64 + ps[j].b }
+        if xs[i] > 50 { break }
+      }
+      return sum
+    }
+  `)
+  const ref = (from: number, to: number) => {
+    let sum = 0
+    for (let i = from; i < to; i++) { if (i === 3) continue; for (let j = i; j < to; j++) sum += j * 10 + j + i + j * 0.5; if (i * 10 > 50) break }
+    return sum
+  }
+  expect(x.go(0, 8)).toBe(ref(0, 8))
+  expect(x.go(2, 7)).toBe(ref(2, 7))
+  expect(x.go(5, 5)).toBe(0)
+  expect(fails('export fn a() { for i in 0..4 { i = 2 } }')).toContain('a for-loop counter cannot be assigned')
+})
+
 test('simd', () => {
   const x = run(`
     static m: [f32x4; 4]
@@ -233,6 +276,7 @@ test('JavaScript bindings: the import section is the manifest', () => {
     extern call Promise.then(f: func): ext
     extern call Promise.resolve(v: any): ext as resolved
     extern val Promise: ext
+    extern js describe(o: ext, n: i32): ext = "(o, n) => Object.keys(o).slice(0, n).join('+')"
     static data: [u8; 4] = [7, 8, 9, 10]
     var later = 0
     fn onValue(v: i32) { later = v * 2 }
@@ -243,7 +287,7 @@ test('JavaScript bindings: the import section is the manifest', () => {
       put(m, 2, 40)
       let o = { name: "nib", n: size(m), list: [1, "two", 3.5], big: 4000000000 as u32 }
       push(__seen, o, lookup(m, "a") + lookup(m, 2), hypot(3, 4), join(prop(o, "list"), "-"))
-      push(__seen, Uint8Array(buffer(prop(exports, "memory")), data as i32 + 1, 2))
+      push(__seen, Uint8Array(buffer(prop(exports, "memory")), data as i32 + 1, 2), describe(o, 3), { fixed: [1, true, null, "s"], nested: { deep: [m] } })
       then(resolved(Promise, 21), onValue)
       return null
     }
@@ -252,6 +296,11 @@ test('JavaScript bindings: the import section is the manifest', () => {
   expect(g.__seen[0]).toEqual({ name: 'nib', n: 2, list: [1, 'two', 3.5], big: 4000000000 })
   expect(g.__seen.slice(1, 4)).toEqual([41.5, 5, '1-two-3.5'])
   expect([...g.__seen[4]]).toEqual([8, 9])
+  expect(g.__seen[5]).toBe('name+n+list')
+  expect(g.__seen[6]).toEqual({ fixed: [1, true, null, 's'], nested: { deep: [new Map<any, any>([['a', 1.5], [2, 40]])] } })
+  // a literal is one import whose name is the JavaScript that builds it, constants included
+  const { wasm } = compile('m', { read: () => 'export fn f(x: i32): ext { return { size: [x, 4], label: "hi", on: true } }' })
+  expect(WebAssembly.Module.imports(new WebAssembly.Module(wasm))).toEqual([{ module: 'js', name: '(a)=>({size:[a,4],label:"hi",on:true})', kind: 'function' }])
   return Promise.resolve().then(() => expect(x.peek()).toBe(42))
 })
 

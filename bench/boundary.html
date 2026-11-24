@@ -1,0 +1,67 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Nib: the cost of calling the DOM from Wasm</title>
+<body style="font: 14px ui-monospace, monospace; padding: 2rem">
+<p>Nanoseconds per call from Wasm, best of 5. Build first with <code>bun bench/run.ts --build-only</code>.</p>
+<pre id="out">running…</pre>
+<script type="module">
+import { runtime } from './out/runtime.js'
+
+const module = await WebAssembly.compileStreaming(fetch('out/boundary.wasm'))
+const nib = runtime()
+const bound = f => Function.prototype.call.bind(f)
+const proto = (C, name, kind) => bound(Object.getOwnPropertyDescriptor(C.prototype, name)[kind])
+
+// The same six bindings, three ways. The keys are the import names the compiler wrote.
+const strategies = {
+  'Nib loader: one arrow per call shape': nib,
+  'Function.prototype.call.bind(native)': {
+    str: nib.str,
+    js: {
+      '(a,b)=>a.hasAttribute(b)': proto(Element, 'hasAttribute', 'value'),
+      'a=>a.firstChild': proto(Node, 'firstChild', 'get'),
+      'a=>a.clientWidth': proto(Element, 'clientWidth', 'get'),
+      '(a,b)=>{a.scrollTop=b}': proto(Element, 'scrollTop', 'set'),
+      '(a)=>a.now()': proto(Performance, 'now', 'value'),
+      'Math.hypot': Math.hypot,
+    },
+  },
+  'One closure shared by every name': (() => {
+    const get = n => o => o[n], set = n => (o, v) => { o[n] = v }, call = n => (o, ...a) => o[n](...a)
+    return {
+      str: nib.str,
+      js: {
+        '(a,b)=>a.hasAttribute(b)': call('hasAttribute'), 'a=>a.firstChild': get('firstChild'), 'a=>a.clientWidth': get('clientWidth'),
+        '(a,b)=>{a.scrollTop=b}': set('scrollTop'), '(a)=>a.now()': call('now'), 'Math.hypot': Math.hypot,
+      },
+    }
+  })(),
+}
+
+const el = document.createElement('div')
+el.id = 'x'
+el.append('text')
+document.body.append(el)
+const N = 2e6
+const tests = {
+  method: x => x.method(el, N), getter: x => x.getter(el, N), layout_getter: x => x.layout_getter(el, N), setter: x => x.setter(el, N),
+  no_arguments: x => x.no_arguments(performance, N), plain_function: x => x.plain_function(N),
+}
+const rows = {}
+for (const [label, imports] of Object.entries(strategies)) {
+  const x = new WebAssembly.Instance(module, imports).exports
+  rows[label] = {}
+  for (const [name, test] of Object.entries(tests)) {
+    test(x); test(x)
+    let best = Infinity
+    for (let i = 0; i < 5; i++) { const t = performance.now(); test(x); best = Math.min(best, performance.now() - t) }
+    rows[label][name] = best / N * 1e6
+  }
+}
+const names = Object.keys(tests)
+document.getElementById('out').textContent = [
+  ''.padEnd(40) + names.map(n => n.padStart(16)).join(''),
+  ...Object.entries(rows).map(([label, r]) => label.padEnd(40) + names.map(n => r[n].toFixed(1).padStart(16)).join('')),
+].join('\n')
+window.done = true
+</script>

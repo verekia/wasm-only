@@ -1,0 +1,13 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Nib against clang -O3</title>
+<body style="font: 14px ui-monospace, monospace; padding: 2rem">
+<p>The same kernels compiled by clang -O3 and by Nib, in this browser. Milliseconds per call, best of 7.
+Build first with <code>bun bench/run.ts --build-only</code>.</p>
+<pre id="out">running…</pre>
+<script type="module">
+import { measure, report } from './harness.js'
+const bytes = async url => new Uint8Array(await (await fetch(url)).arrayBuffer())
+document.getElementById('out').textContent = report(measure(await bytes('out/c.wasm'), await bytes('out/nib.wasm')))
+window.done = true
+</script>
