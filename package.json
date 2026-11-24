@@ -5,8 +5,8 @@
   "private": true,
   "bin": { "nib": "nib/cli.ts" },
   "scripts": {
-    "dev": "bun nib/cli.ts dev demo",
-    "build": "bun nib/cli.ts build demo --out dist",
+    "dev": "bun nib/cli.ts dev examples",
+    "build": "bun nib/cli.ts build examples --out dist",
     "test": "bun test",
     "bench": "bun bench/run.ts"
   }

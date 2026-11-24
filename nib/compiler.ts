@@ -2,7 +2,7 @@
 // struct scalarisation all happen while emitting. Nothing is compiled unless an export reaches it.
 
 import { parse, walk, fail, type File } from './syntax.ts'
-import { runtime } from './loader.ts'
+import { instantiate } from './loader.ts'
 
 // ---------------------------------------------------------------- types
 
@@ -46,8 +46,8 @@ const valueType = (t: Type): Type => t.kind === 'int' && t.size < 4 ? T.i32 : t
 // ---------------------------------------------------------------- encoding
 
 type Code = (number | Func | Glob)[]     // bytes, plus references resolved once indices are final
-interface Func { idx: number; type: number; name: string; imp?: [string, string]; exp?: string; locals: number[]; code: Code }
-interface Glob { idx: number; w: number; mut: boolean; imp?: [string, string]; init: Code }
+interface Func { idx: number; type: number; name: string; imp?: string; exp?: string; locals: number[]; code: Code }   // imp: the JavaScript an import binds to
+interface Glob { idx: number; w: number; mut: boolean; imp?: string; init: Code }
 
 function uleb(n: number, out: number[] = []): number[] {
   do { const b = n & 0x7f; n >>>= 7; out.push(n ? b | 0x80 : b) } while (n)
@@ -93,6 +93,7 @@ const FLOAT_FNS: Record<string, [number, number, (x: number) => number]> = {
 }
 const BIT_FNS: Record<string, number> = { clz: 0x67, ctz: 0x68, popcnt: 0x69 }
 const LANES = 'xyzw'
+const global = (path: string) => 'globalThis.' + path.replaceAll('.', '?.')         // undefined, never a ReferenceError
 const param = (i: number) => i < 26 ? String.fromCharCode(97 + i) : 'a' + i          // names for generated JS parameters
 
 function fold(op: string, t: Type, a: any, b: any): any {
@@ -153,7 +154,6 @@ type Place = { t: Type; pre?: Code } & (
 class Program {
   decls = new Map<string, any>()
   files: string[] = []
-  host?: WebAssembly.Imports
   opts: Options
   private addrs = new Map<any, number>()
   comptime = new Map<any, { t: Type; ks: any[] }>()
@@ -309,6 +309,10 @@ class Unit {
   private statics = new Set<any>()
   private segs: { addr: number; bytes: Uint8Array }[] = []
   private elems = new Set<Func>()
+  private heap?: Glob
+  /** After finish(): the JavaScript expression for this module's import object, and its parts. */
+  bindings = '{}'
+  table: string[] = []
   private queue: any[] = []
   private usesMem = false
 
@@ -342,19 +346,21 @@ class Unit {
   private blockType(t: Type): number[] {
     return t.flat.length === 0 ? [0x40] : t.flat.length === 1 ? t.flat : sleb(this.functype([], t.flat))
   }
-  private imp(mod: string, field: string, params: number[], results: number[]): Func {
-    const type = this.functype(params, results), key = `${mod}\0${field}\0${type}`
+  /** Imports the function that the JavaScript expression `source` evaluates to. */
+  private imp(source: string, params: number[], results: number[]): Func {
+    const type = this.functype(params, results), key = `${source}\0${type}`
     let f = this.fimports.get(key)
-    if (!f) this.fimports.set(key, f = { idx: 0, type, name: field, imp: [mod, field], locals: [], code: [] })
+    if (!f) this.fimports.set(key, f = { idx: 0, type, name: source, imp: source, locals: [], code: [] })
     return f
   }
-  private gimp(mod: string, field: string, w: number): Glob {
-    const key = `${mod}\0${field}\0${w}`
+  /** Imports the value of the JavaScript expression `source` as a constant global. */
+  private gimp(source: string, w: number): Glob {
+    const key = `${source}\0${w}`
     let g = this.gimports.get(key)
-    if (!g) this.gimports.set(key, g = { idx: 0, w, mut: false, imp: [mod, field], init: [] })
+    if (!g) this.gimports.set(key, g = { idx: 0, w, mut: false, imp: source, init: [] })
     return g
   }
-  private str(s: string): Val { return { t: T.ext, c: [0x23, this.gimp('str', s, EXT)], k: s, pure: true } }
+  private str(s: string): Val { return { t: T.ext, c: [0x23, this.gimp(JSON.stringify(s), EXT)], k: s, pure: true } }
 
   fn(d: any): Func {
     let f = this.fnOf.get(d)
@@ -531,7 +537,7 @@ class Unit {
         if (d.n === 'fn') { const f = this.fn(d); this.elems.add(f); return { t: T.func, c: [0xd2, f], pure: true } }
         if (d.n === 'extern' && d.kind === 'val') {
           const t = d.ret ? this.P.type(d.ret, d.file) : T.ext
-          return { t, c: [0x23, this.gimp('val', d.path, t.w)], pure: true }
+          return { t, c: [0x23, this.gimp(global(d.path), t.w)], pure: true }
         }
         return this.err(`'${n.name}' cannot be used as a value`, n)
       }
@@ -621,7 +627,7 @@ class Unit {
       return k === null ? 'null' : typeof k === 'string' ? JSON.stringify(k) : typeof k === 'bigint' ? k + 'n' : v.t === T.bool ? String(!!k) : String(k)
     }
     const body = emit(n)
-    return { t: T.ext, c: [...args.flatMap(v => v.c), 0x10, this.imp('js', `(${args.map((_, i) => param(i))})=>(${body})`, args.flatMap(v => v.t.flat), [EXT])] }
+    return { t: T.ext, c: [...args.flatMap(v => v.c), 0x10, this.imp(`(${args.map((_, i) => param(i))})=>(${body})`, args.flatMap(v => v.t.flat), [EXT])] }
   }
 
   private arith(op: string, a: Val, b: Val, n: any): Val {
@@ -763,16 +769,16 @@ class Unit {
     if (n.args.length < ps.length || (n.args.length > ps.length && !d.variadic))
       this.err(`${n.name}() takes ${ps.length} argument${ps.length === 1 ? '' : 's'}, found ${n.args.length}`, n)
     const vs: Val[] = n.args.map((a: any, i: number) => ps[i] ? this.coerce(this.expr(a), ps[i]!, a) : this.js(this.expr(a), a))
-    // The import's name is the JavaScript it binds to: a function value, or a one-line arrow
-    // with exactly this call's arity, which the engine can inline and specialise like any other.
+    // Each binding is a line of JavaScript: a function value, or an arrow with exactly this call's
+    // arity, which the engine can inline and specialise like any hand-written glue.
     const flat = vs.flatMap(v => v.t.flat), names = flat.map((_, i) => param(i)), member = d.path.slice(d.path.lastIndexOf('.') + 1)
-    const source = d.kind === 'fn' ? d.path
-      : d.kind === 'js' ? d.source
+    const source = d.kind === 'fn' ? global(d.path) + '||F'            // F throws: a missing API fails when called, not at load
+      : d.kind === 'js' ? `(${d.source})`
       : d.kind === 'new' ? `(${names})=>new ${d.path}(${names})`
       : d.kind === 'get' ? `a=>a.${member}`
       : d.kind === 'set' ? `(a,b)=>{a.${member}=b}`
       : `(${names})=>a.${member}(${names.slice(1)})`
-    return { t: ret, c: [...vs.flatMap(v => v.c), 0x10, this.imp('js', source, flat, ret.flat)] }
+    return { t: ret, c: [...vs.flatMap(v => v.c), 0x10, this.imp(source, flat, ret.flat)] }
   }
 
   /** Expands an `inline fn` in place. Constant arguments stay constant inside the body. */
@@ -864,6 +870,14 @@ class Unit {
         return { t: T.bool, c: [...v.c, 0xd1], pure: v.pure }
       }
       case 'unreachable': need(0); return { t: VOID, c: [0x00] }
+      case 'memory_pages': need(0); this.usesMem = true; return { t: T.i32, c: [0x3f, 0] }
+      case 'memory_grow': need(1); this.usesMem = true; return { t: T.i32, c: [...word(0).c, 0x40, 0] }      // the old size, or -1
+      case 'heap_base': {          // the first address after every static, known once the whole program is compiled
+        need(0)
+        this.usesMem = true
+        if (!this.heap) this.globals.push(this.heap = { idx: 0, w: I32, mut: false, init: [] })
+        return { t: T.i32, c: [0x23, this.heap], pure: true }
+      }
       case 'embed': {              // a file's text as a string constant
         need(1)
         if (a[0].n !== 'str') this.err('embed() takes a path string', n)
@@ -1006,11 +1020,12 @@ class Unit {
   /** Wraps a value in an exported function, instantiates the module in the compiler's own engine and returns its exports. */
   run(v: Val): WebAssembly.Exports {
     this.funcs.push({ idx: 0, type: this.functype([], v.t.flat), name: '__ct', exp: '__ct', locals: this.locals, code: v.c })
-    return new WebAssembly.Instance(new WebAssembly.Module(this.finish(false)), this.P.host ??= runtime()).exports
+    return instantiate(this.finish(false), this.bindings).exports
   }
 
   finish(names: boolean): Uint8Array<ArrayBuffer> {
     this.drain()
+    if (this.heap) this.heap.init = [0x41, ...sleb((this.P.top + 15) & -16)]
     // Keep only what the exports can reach in the code that was actually emitted. Folding and
     // inlining leave things behind (a string that ended up inside a literal's source, say).
     const live = new Set<Func | Glob>(), todo: (Func | Glob)[] = this.funcs.filter(f => f.exp)
@@ -1036,10 +1051,25 @@ class Unit {
     }
     const mem = this.usesMem || this.segs.length > 0
 
+    // The binding table: one JavaScript expression per distinct import. Imports refer to it by
+    // position, under a module name derived from its contents, so a page can never be linked
+    // against a table from a different build.
+    const slots = new Map<string, number>()
+    const fields = [...fimports, ...gimports].map(x => {
+      if (!slots.has(x.imp!)) slots.set(x.imp!, slots.size)
+      return name(String(slots.get(x.imp!)))
+    })
+    this.table = [...slots.keys()]
+    let hash = 0x811c9dc5
+    for (const ch of this.table.join('\n')) hash = Math.imul(hash ^ ch.codePointAt(0)!, 0x01000193)
+    const key = 'n' + (hash >>> 0).toString(36), keyName = name(key), object = `{${key}:[${this.table.join()}]}`
+    this.bindings = !this.table.length ? '{}'
+      : this.table.some(e => e.endsWith('||F')) ? `(F=>(${object}))(()=>{throw Error("nib: missing binding")})` : object
+
     section(1, this.typeDefs)
     section(2, [
-      ...fimports.map(f => [...name(f.imp![0]), ...name(f.imp![1]), 0, ...uleb(f.type)]),
-      ...gimports.map(g => [...name(g.imp![0]), ...name(g.imp![1]), 3, g.w, 0]),
+      ...fimports.map((f, i) => [...keyName, ...fields[i], 0, ...uleb(f.type)]),
+      ...gimports.map((g, i) => [...keyName, ...fields[fimports.length + i], 3, g.w, 0]),
     ])
     section(3, funcs.map(f => uleb(f.type)))
     if (mem) section(5, [[0, ...uleb(Math.ceil(this.P.top / 65536))]])
@@ -1092,7 +1122,15 @@ function hasContinue(body: any[]): boolean {
 
 // ---------------------------------------------------------------- entry point
 
-export interface Output { wasm: Uint8Array<ArrayBuffer>; files: string[] }
+export interface Output {
+  wasm: Uint8Array<ArrayBuffer>
+  /** A JavaScript expression that evaluates to the module's import object. */
+  bindings: string
+  /** The source of each binding, in table order. */
+  table: string[]
+  /** Every file that was read, for watchers. */
+  files: string[]
+}
 
 /** Compiles the program rooted at `entry`. Every `export fn` becomes a WebAssembly export. */
 export function compile(entry: string, opts: Options): Output {
@@ -1100,5 +1138,6 @@ export function compile(entry: string, opts: Options): Output {
   P.load(entry)
   const u = new Unit(P)
   for (const d of P.decls.values()) if (d.n === 'fn' && d.exported) u.fn(d)
-  return { wasm: u.finish(!!opts.debug), files: P.files }
+  const wasm = u.finish(!!opts.debug)
+  return { wasm, bindings: u.bindings, table: u.table, files: P.files }
 }

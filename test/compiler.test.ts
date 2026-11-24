@@ -1,12 +1,12 @@
 import { test, expect } from 'bun:test'
 import { compile } from '../nib/compiler.ts'
-import { runtime } from '../nib/loader.ts'
+import { instantiate } from '../nib/loader.ts'
 
 /** Compiles `src` (plus optional extra files) and returns the instance's exports. */
 function run(src: string, files: Record<string, string> = {}): any {
   const all: Record<string, string> = { 'main.nib': src, ...files }
-  const { wasm } = compile('main.nib', { read: p => { if (p in all) return all[p]; throw new Error('missing ' + p) }, debug: true })
-  return new WebAssembly.Instance(new WebAssembly.Module(wasm), runtime()).exports
+  const { wasm, bindings } = compile('main.nib', { read: p => { if (p in all) return all[p]; throw new Error('missing ' + p) }, debug: true })
+  return instantiate(wasm, bindings).exports
 }
 const fails = (src: string) => { try { run(src) } catch (e: any) { return e.message as string } return '' }
 
@@ -258,7 +258,7 @@ test('simd', () => {
   expect(x.go(s)).toBe(col(3).reduce((a, b) => a + Math.abs(b), 0) + Math.max(col(0)[1], col(1)[1]))
 })
 
-test('JavaScript bindings: the import section is the manifest', () => {
+test('JavaScript bindings', () => {
   const g = globalThis as any
   g.__seen = []
   const x = run(`
@@ -298,9 +298,10 @@ test('JavaScript bindings: the import section is the manifest', () => {
   expect([...g.__seen[4]]).toEqual([8, 9])
   expect(g.__seen[5]).toBe('name+n+list')
   expect(g.__seen[6]).toEqual({ fixed: [1, true, null, 's'], nested: { deep: [new Map<any, any>([['a', 1.5], [2, 40]])] } })
-  // a literal is one import whose name is the JavaScript that builds it, constants included
-  const { wasm } = compile('m', { read: () => 'export fn f(x: i32): ext { return { size: [x, 4], label: "hi", on: true } }' })
-  expect(WebAssembly.Module.imports(new WebAssembly.Module(wasm))).toEqual([{ module: 'js', name: '(a)=>({size:[a,4],label:"hi",on:true})', kind: 'function' }])
+  // a literal is one binding: the JavaScript that builds it, constants included
+  const out = compile('m', { read: () => 'export fn f(x: i32): ext { return { size: [x, 4], label: "hi", on: true } }' })
+  expect(out.table).toEqual(['(a)=>({size:[a,4],label:"hi",on:true})'])
+  expect(WebAssembly.Module.imports(new WebAssembly.Module(out.wasm))).toEqual([{ module: out.bindings.slice(1, out.bindings.indexOf(':')), name: '0', kind: 'function' }])
   return Promise.resolve().then(() => expect(x.peek()).toBe(42))
 })
 
@@ -372,4 +373,39 @@ test('assorted code generation paths agree with JavaScript', () => {
   expect(x.bits(0x00f0)).toBe(4 + 400 + 15 * 10000)
   expect([x.twice(0.1), x.twice(-Infinity), x.half(0.3), x.half(5e-324), x.eighth(3), x.third(1)]).toEqual([0.2, -Infinity, 0.15, 5e-324 / 2, Math.fround(3 / 8), 1 / 3])
   expect(x.twice(NaN)).toBeNaN()
+})
+
+test('bindings are a static table, and missing APIs fail only when used', () => {
+  const src = `
+    extern fn no.such.thing(x: i32): i32
+    extern fn Math.max(a: i32, b: i32): i32 as biggest
+    extern val also.missing: ext
+    extern fn Boolean(v: any): bool
+    extern call String.toUpperCase(): ext
+    export fn ok(): i32 { return biggest(3, 9) + (Boolean(missing) ? 100 : 0) }
+    export fn shout(): ext { return toUpperCase("abc") }
+    export fn bad(): i32 { return thing(1) }
+  `
+  const out = compile('m', { read: () => src })
+  expect(out.table).toEqual(['globalThis.Math?.max||F', 'globalThis.Boolean||F', '(a)=>a.toUpperCase()', 'globalThis.no?.such?.thing||F', 'globalThis.also?.missing', '"abc"'])
+  expect(out.bindings).not.toContain('eval')
+  const x = instantiate(out.wasm, out.bindings).exports as any
+  expect(x.ok()).toBe(9)
+  expect(x.shout()).toBe('ABC')
+  expect(() => x.bad()).toThrow('nib: missing binding')
+})
+
+test('memory builtins', () => {
+  const x = run(`
+    static pad: [u8; 100]
+    export fn base(): i32 { return heap_base() }
+    export fn pages(): i32 { return memory_pages() }
+    export fn grow(n: i32): i32 { return memory_grow(n) }
+    export fn poke(): i32 { pad[99] = 7; let p = (heap_base() + 70000) as *i32; p[0] = 5; return p[0] + pad[99] }
+  `)
+  expect(x.base()).toBe(128)
+  expect(x.pages()).toBe(1)
+  expect(x.grow(2)).toBe(1)
+  expect(x.pages()).toBe(3)
+  expect(x.poke()).toBe(12)
 })

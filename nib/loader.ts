@@ -1,36 +1,22 @@
-// The entire JavaScript runtime of a Nib program.
+// How a Nib module reaches JavaScript.
 //
-// A compiled module's import section is its binding manifest. Each import names the JavaScript
-// it wants, and this resolves them all the same way, so it never grows with the application.
+// Wasm can only call what it imports, so the compiler writes one line of JavaScript per distinct
+// binding and collects them in a table:
 //
-//   module "str", field: any text                  the string itself
-//   module "val", field: "document"                the value of that expression, read once
-//   module "js",  field: "Math.sin"                a function to call, or a one-line arrow
-//                        "(a,b)=>a.submit(b)"      the compiler wrote for one call shape
+//   {n1x9k2a:[(a,b)=>a.getElementById(b), (a)=>({size:a,usage:72}), globalThis.document, "input"]}
 //
-// Why arrows rather than binding native functions directly: measured in Chromium 158, a
-// Wasm → JS-arrow → DOM call is as fast as hand-written glue, and 10–40% faster than
-// `Function.prototype.call.bind(nativeMethod)`, because each arrow is ordinary JavaScript with
-// its own inline caches. See the measurements in README.md.
+// The module imports from that table by position. The table is plain script: nothing is
+// evaluated from strings at run time, so a page works under a Content-Security-Policy of
 //
-// A binding the browser cannot provide becomes a function that throws when called, so a page
-// still loads and can feature-detect. Evaluating source needs a Content-Security-Policy that
-// allows 'unsafe-eval'.
+//   default-src 'self'; script-src 'self' 'wasm-unsafe-eval'
+//
+// Each arrow has exactly the arity of the call it serves. Measured in Chromium, that is as fast
+// as hand-written glue and faster than binding native functions directly (see README.md).
 
-export function runtime(): WebAssembly.Imports {
-  const run = eval                       // called indirectly: sources see only the global scope
-  const table = (resolve: (field: string) => unknown) => new Proxy({}, { get: (_, field: string) => resolve(field) })
-  return {
-    str: table(text => text),
-    val: table(source => { try { return run(source) } catch { } }),
-    js: table(source => {
-      let f
-      try { f = run(source) } catch { }
-      return f ?? (() => { throw Error('nib: no ' + source) })
-    }),
-  }
-}
+/** The whole script a page loads: fetch, link against the bindings, call `main(exports)` if it is exported. */
+export const boot = (wasmUrl: string, bindings: string): string =>
+  `WebAssembly.instantiateStreaming(fetch(${JSON.stringify(wasmUrl)}),${bindings}).then(r=>r.instance.exports.main?.(r.instance.exports))\n`
 
-/** The script that boots `url` in a browser. If the module exports `main`, it is called with the exports. */
-export const boot = (url: string): string =>
-  `WebAssembly.instantiateStreaming(fetch(${JSON.stringify(url)}),(${runtime})()).then(r=>r.instance.exports.main?.(r.instance.exports))`
+/** Instantiates a compiled module in the current JavaScript environment: for the compiler itself and for tests. */
+export const instantiate = (wasm: Uint8Array<ArrayBuffer>, bindings: string): WebAssembly.Instance =>
+  new WebAssembly.Instance(new WebAssembly.Module(wasm), (0, eval)(`(${bindings})`))
