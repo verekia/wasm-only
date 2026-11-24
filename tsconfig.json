@@ -1,0 +1,16 @@
+{
+  "compilerOptions": {
+    "target": "esnext",
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "lib": ["esnext", "dom"],
+    "types": ["bun", "@webgpu/types"],
+    "strict": true,
+    "noEmit": true,
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": true,
+    "skipLibCheck": true,
+    "paths": { "nib": ["./lib/index.ts"], "nib/*": ["./lib/*.ts"] }
+  },
+  "include": ["nib", "lib", "examples", "bench", "test"]
+}

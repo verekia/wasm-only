@@ -1,524 +1,445 @@
+// Every program here runs twice: compiled to Wasm, and imported as the plain TypeScript it is.
+// The two must give identical results: that is the language's whole contract.
+
 import { test, expect } from 'bun:test'
-import { readFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { dirname } from 'node:path'
 import { compile } from '../nib/compiler.ts'
 import { instantiate } from '../nib/loader.ts'
 
-/** Compiles `src` (plus optional extra files) and returns the instance's exports. */
-function run(src: string, files: Record<string, string> = {}): any {
-  const all: Record<string, string> = { 'main.nib': src, ...files }
-  const read = (p: string) => p in all ? all[p] : readFileSync(p, 'utf8')          // std/ and examples/ come from the repository
-  const { wasm, bindings } = compile('main.nib', { read, std: import.meta.dir + '/../std', debug: true })
-  return instantiate(wasm, bindings).exports
+const TMP = `${import.meta.dir}/.tmp`
+rmSync(TMP, { recursive: true, force: true })
+let count = 0
+
+async function both(src: string | Record<string, string>) {
+  const files = typeof src === 'string' ? { 'main.ts': src } : src
+  const dir = `${TMP}/${count++}`
+  for (const [path, text] of Object.entries(files)) {
+    mkdirSync(dirname(`${dir}/${path}`), { recursive: true })
+    writeFileSync(`${dir}/${path}`, text)
+  }
+  const out = compile(`${dir}/main.ts`, { read: p => readFileSync(p, 'utf8'), lib: `${import.meta.dir}/../lib`, debug: true })
+  return { out, wasm: instantiate(out.wasm, out.glue), js: await import(`${dir}/main.ts`) }
 }
-const fails = (src: string) => { try { run(src) } catch (e: any) { return e.message as string } return '' }
 
-test('arithmetic, precedence and literal typing', () => {
-  const x = run(`
-    export fn a(x: i32, y: i32): i32 { return x + y * 2 - (x & 3) }
-    export fn b(x: f32): f32 { return x * 0.5 + 1 }
-    export fn c(x: f64): f64 { return -x / 4 }
-    export fn d(x: u32): u32 { return x >> 1 }
-    export fn e(x: i32): i32 { return x >> 1 }
-    export fn f(x: u32, y: u32): bool { return x < y }
-    export fn g(x: i32): i32 { return ~x % 7 }
-    export fn h(x: i64): i64 { return x * 3 + 1 }
-  `)
-  expect(x.a(5, 7)).toBe(5 + 14 - 1)
-  expect(x.b(3)).toBe(2.5)
-  expect(x.c(8)).toBe(-2)
-  expect(x.d(-2) >>> 0).toBe(0x7fffffff)
-  expect(x.e(-2)).toBe(-1)
-  expect(x.f(1, -1)).toBe(1)
-  expect(x.g(10)).toBe(~10 % 7)
-  expect(x.h(5n)).toBe(16n)
+/** Makes the same calls on both and expects the same answers. Returns the answers. */
+async function same(src: string | Record<string, string>, calls: [string, ...any[]][]): Promise<any[]> {
+  const { wasm, js } = await both(src)
+  const plain = (v: any) => ArrayBuffer.isView(v) ? [...(v as any)] : v
+  const results = calls.map(([f, ...args]) => plain(js[f](...args)))
+  calls.forEach(([f, ...args], i) => expect([f, args, plain(wasm[f](...args))]).toEqual([f, args, results[i]]))
+  return results
+}
+const fails = (src: string) => { try { compile('main.ts', { read: () => src }) } catch (e: any) { return e.message as string } return '' }
+
+test('numbers mean what they mean in JavaScript', async () => {
+  const r = await same(`
+    import type { i32, u32 } from 'nib'
+    export function mix(a: number, b: number): number { return a + b * 2 - (a - b) / 4 }
+    export function ints(a: i32, b: i32): i32 { return a * b + (a - b) % 7 }
+    export function divide(a: i32, b: i32): number { return a / b }
+    export function truncated(a: i32, b: i32): i32 { return (a / b) | 0 }
+    export function bits(a: number, b: i32): i32 { return (a | 0) ^ (b << 3) ^ (b >> 1) ^ ~b }
+    export function unsigned(a: i32): u32 { return a >>> 0 }
+    export function shifted(a: i32): number { return (a >>> 1) + 1 }
+    export function wrap(x: number): i32 { return x | 0 }
+    export function compare(a: i32, b: number): boolean { return a < b && a !== 3 || b >= 100 }
+    export function negate(a: i32, b: number): number { return -a + -b }
+    export function inferred(n: i32): number {
+      let count = 0              // stays an integer
+      let total = 0              // becomes a number at the first fractional value
+      for (let i = 0; i < n; i++) { count += i; total += i / 3 }
+      return count + total
+    }
+    export function hash(n: i32): u32 {
+      let h = 2166136261 | 0
+      for (let i = 0; i < n; i++) {
+        h = Math.imul(h ^ i, 16777619)
+        h = h ^ (h >>> 13)
+        h = ((h << 7 | h >>> 25) + i) | 0
+      }
+      return h >>> 0
+    }
+    export function truthy(x: number, i: i32): i32 { return (x ? 1 : 0) + (i ? 10 : 0) + (!x ? 100 : 0) }
+    const BIG = 2 ** 0.5 > 1 ? 7 / 2 : 0
+    export function constants(): number { return BIG + 0x10 + 1e3 + 1_000 + (6 / 2) + (7 % 4) + (1 << 4) }
+  `.replace('2 ** 0.5 > 1', 'Math.sqrt(2) > 1'), [
+    ['mix', 1.5, 2.25], ['ints', 7, -3], ['ints', -7, 3], ['divide', 7, 2], ['divide', 1, 3], ['truncated', 7, 2], ['truncated', -7, 2],
+    ['bits', 5.9, 3], ['bits', -5.9, -3], ['unsigned', -1], ['shifted', -1], ['wrap', 2 ** 31 + 5.5], ['wrap', -(2 ** 32) - 7.2], ['wrap', NaN], ['wrap', 1e15],
+    ['compare', 1, 2.5], ['compare', 3, 2.5], ['compare', 3, 100], ['negate', 5, 2.5], ['negate', 0, 1],
+    ['inferred', 10], ['hash', 1000], ['truthy', NaN, 0], ['truthy', 0.1, 5], ['truthy', 0, -1], ['constants'],
+  ])
+  expect(r[3]).toBe(3.5)
+  expect(r[5]).toBe(3)
+  expect(r[9]).toBe(4294967295)
+  expect(r[20]).toBe(45 + 15)
 })
 
-test('casts', () => {
-  const x = run(`
-    export fn a(x: f32): i32 { return x as i32 }
-    export fn b(x: i32): f64 { return x as f64 / 2.0 }
-    export fn c(x: i32): i32 { return x as u8 }
-    export fn d(x: i32): i32 { return x as i8 }
-    export fn e(x: u32): f64 { return x as f64 }
-    export fn f(): i32 { return 3.99 as i32 + (300 as u8) }
-    export fn g(x: i32): i64 { return x as i64 }
-  `)
-  expect(x.a(-3.7)).toBe(-3)
-  expect(x.a(1e20)).toBe(2 ** 31 - 1)
-  expect(x.b(3)).toBe(1.5)
-  expect(x.c(0x1ff)).toBe(0xff)
-  expect(x.d(0xff)).toBe(-1)
-  expect(x.e(-1)).toBe(2 ** 32 - 1)
-  expect(x.f()).toBe(3 + 44)
-  expect(x.g(-2)).toBe(-2n)
+test('Math', async () => {
+  const src = `
+    import type { i32 } from 'nib'
+    export function round(x: number): number { return Math.round(x) }
+    export function floor(x: number): number { return Math.floor(x) + Math.ceil(x) * 10 + Math.trunc(x) * 100 }
+    export function abs(x: number, i: i32): number { return Math.abs(x) + Math.abs(i) }
+    export function least(a: number, b: number, c: i32, d: i32): number { return Math.min(a, b) + Math.max(a, b, 3) * 10 + Math.min(c, d) * 100 + Math.max(c, d, 0) * 1000 }
+    export function root(x: number): number { return Math.sqrt(x) }
+    export function single(a: number, b: number): number { const x = Math.fround(a), y = Math.fround(b); return Math.fround(x * y) + Math.fround(x + y) + Math.fround(a) }
+    export function leading(x: i32): i32 { return Math.clz32(x) ^ Math.imul(x, 0x7fffffff) }
+    export function trig(x: number): number { return Math.sin(x) + Math.atan2(x, 2) + Math.pow(x, 3) + Math.hypot(x, 4) }
+    const TABLE = Math.cos(Math.PI / 3) + Math.E
+    export function constant(): number { return TABLE }
+    export function floatMod(a: number, b: number): number { return a % b }
+  `
+  await same(src, [
+    ...[0.5, 1.5, 2.5, -0.5, -1.5, -2.5, 0.49999999999999994, 2.4, -2.6, 1e20, -0].map(x => ['round', x] as [string, number]),
+    ['floor', 2.7], ['floor', -2.7], ['abs', -3.5, -9], ['abs', 3.5, 9], ['least', 1.5, -2, 7, -8], ['least', NaN, 1, 2, 2],
+    ['root', 2], ['root', -1], ['single', 0.1, 0.7], ['leading', 1], ['leading', 0], ['leading', -5], ['trig', 0.3], ['constant'], ['floatMod', 7.5, 2], ['floatMod', -7.5, 2],
+  ])
+  // Math.cos ran in the compiler: the module calls into JavaScript only for trig() and floatMod()
+  const { out } = await both(src)
+  expect(out.glue.entries.filter(e => e !== 'M$').sort()).toEqual(['(a)=>Math.sin(a)', '(a)=>Math.atan2(a,2)', '(a)=>Math.pow(a,3)', '(a)=>Math.hypot(a,4)', '(a,b)=>a%b'].sort())
 })
 
-test('control flow', () => {
-  const x = run(`
-    export fn sum(n: i32): i32 { let s = 0; for i in 0..n { s += i } return s }
-    export fn collatz(n: i32): i32 {
+test('control flow', async () => {
+  await same(`
+    import type { i32 } from 'nib'
+    export function collatz(n: i32): i32 {
       let steps = 0
-      while n != 1 {
-        if n % 2 == 0 { n = n / 2 } else { n = n * 3 + 1 }
-        steps += 1
+      while (n !== 1) {
+        if (n % 2 === 0) n = (n / 2) | 0
+        else n = n * 3 + 1
+        steps++
       }
       return steps
     }
-    export fn odds(n: i32): i32 {
+    export function odds(n: i32): i32 {
       let s = 0
-      for i in 0..n { if i % 2 == 0 { continue } s += i }
+      for (let i = 0; i < n; i++) { if (i % 2 === 0) continue; s += i }
       return s
     }
-    export fn first(n: i32): i32 {
+    export function firstSquareOver(n: i32): i32 {
       let i = 0
-      loop { if i * i > n { break } i += 1 }
+      for (;;) { if (i * i > n) break; i++ }
       return i
     }
-    export fn nested(n: i32): i32 {
+    export function nested(n: i32): i32 {
       let c = 0
-      for i in 0..n { let j = 0; while j < i { j += 1; if j == 3 { continue } if j > 5 { break } c += 1 } }
+      for (let i = 0; i < n; i++) {
+        let j = 0
+        while (j < i) { j++; if (j === 3) continue; if (j > 5) break; c++ }
+      }
       return c
     }
-    export fn early(x: i32): i32 { if x < 0 { return -1 } else if x == 0 { return 0 } return 1 }
-    export fn pick(x: i32, a: f32, b: f32): f32 { return x > 0 && x < 10 || x == 99 ? a : b }
-  `)
-  expect(x.sum(101)).toBe(5050)
-  expect(x.sum(0)).toBe(0)
-  expect(x.collatz(27)).toBe(111)
-  expect(x.odds(10)).toBe(25)
-  expect(x.first(50)).toBe(8)
-  let c = 0; for (let i = 0; i < 9; i++) { let j = 0; while (j < i) { j++; if (j === 3) continue; if (j > 5) break; c++ } }
-  expect(x.nested(9)).toBe(c)
-  expect([x.early(-5), x.early(0), x.early(5)]).toEqual([-1, 0, 1])
-  expect([x.pick(5, 1, 2), x.pick(50, 1, 2), x.pick(99, 1, 2)]).toEqual([1, 2, 1])
+    export function countdown(n: i32): i32 { let s = 0; do { s += n; n-- } while (n > 0); return s }
+    export function steps(from: number, to: number): number { let s = 0; for (let x = from; x < to; x += 0.25) s += x; return s }
+    export function backwards(n: i32): i32 { let s = 0; for (let i = n - 1; i >= 0; i -= 2) s = s * 3 + i; return s }
+    export function sign(x: number): i32 { if (x < 0) return -1; else if (x === 0) return 0; return 1 }
+    export function pick(x: i32, a: number, b: number): number { return x > 0 && x < 10 || x === 99 ? a : b }
+    let calls = 0
+    function tick(v: boolean): boolean { calls++; return v }
+    export function circuit(a: boolean, b: boolean): i32 { calls = 0; const r = (tick(a) && tick(b)) || (tick(!a) && tick(!b)); return calls * 10 + (r ? 1 : 0) }
+    export function post(n: i32): i32 { let i = n; const a = i++; const b = ++i; const c = i--; return a * 100 + b * 10 + c + i }
+  `, [
+    ['collatz', 27], ['odds', 10], ['firstSquareOver', 50], ['nested', 9], ['countdown', 4], ['countdown', 0], ['steps', 0.5, 3], ['backwards', 7],
+    ['sign', -5], ['sign', 0], ['sign', 5], ['pick', 5, 1, 2], ['pick', 50, 1, 2], ['pick', 99, 1, 2],
+    ['circuit', true, true], ['circuit', true, false], ['circuit', false, false], ['circuit', false, true], ['post', 5],
+  ])
 })
 
-test('structs are values: locals, multi-value returns, nesting, globals', () => {
-  const x = run(`
-    struct V2 { x: f32, y: f32 }
-    struct Box { lo: V2, hi: V2, id: i32 }
-    var acc: V2 = V2(1, 2)
-    fn add(a: V2, b: V2): V2 { return V2(a.x + b.x, a.y + b.y) }
-    fn grow(b: Box, by: f32): Box { b.hi = add(b.hi, V2(by, by)); b.id += 1; return b }
-    export fn area(w: f32, h: f32): f32 {
-      let b = grow(Box(V2(0, 0), V2(w, h), 7), 1)
-      return (b.hi.x - b.lo.x) * (b.hi.y - b.lo.y) + b.id as f32
+test('typed arrays are the memory', async () => {
+  const { out } = await both(`export const N = 3`)
+  expect(out.glue.pages).toBe(0)
+  const r = await same(`
+    import type { i32 } from 'nib'
+    const STRIDE = 3
+    export const points = new Float32Array(4 * STRIDE)
+    const table = new Int32Array([10, 20, 30, 40])
+    const bytes = new Uint8Array([1, 255, 3])
+    const small = new Int8Array(4)
+    const wide = new Float64Array(2)
+    const words = new Uint16Array(4)
+    const big = new Uint32Array(2)
+    const squares = buildSquares()              // filled by the compiler
+    function buildSquares(): Int32Array {
+      const out = new Int32Array(8)
+      for (let i = 0; i < out.length; i++) out[i] = i * i
+      return out
     }
-    export fn pair(a: f32): V2 { return add(V2(a, a), V2(1, 2)) }
-    export fn bump(): f32 { acc = add(acc, V2(10, 20)); acc.x += 0.5; return acc.x + acc.y }
-    export fn field(): f32 { return add(V2(1, 2), V2(3, 4)).y }
-  `)
-  expect(x.area(2, 3)).toBe(3 * 4 + 8)
-  expect(x.pair(5)).toEqual([6, 7])
-  expect(x.bump()).toBe(11.5 + 22)
-  expect(x.bump()).toBe(22 + 42)
-  expect(x.field()).toBe(6)
-})
-
-test('memory: statics, pointers, struct layout, narrow types', () => {
-  const x = run(`
-    struct P { x: f32, y: f32, tag: u8, n: u16 }
-    static ps: [P; 4]
-    static table: [i32; 4] = [10, 20, 30, 40]
-    static bytes: [u8; 3] = [1, 255, 3]
-    export fn size(): i32 { return sizeof(P) }
-    export fn fill() { for i in 0..4 { ps[i] = P(i as f32, 2.0, 200 + i, 1000 * i) } }
-    export fn get(i: i32): f32 { let p = ps[i]; return p.x + p.y + p.tag as f32 + p.n as f32 }
-    export fn viaPtr(i: i32): i32 { let p = &ps[i]; p.n += 5; return p.n }
-    export fn look(i: i32): i32 { return table[i] + table[3] + bytes[1] }
-    export fn raw(): i32 { let q = &ps[1].y as *u32; return q[0] as i32 }
-    export fn swap() { let t = ps[0]; ps[0] = ps[3]; ps[3] = t }
-    export fn where(): i32 { return &ps[2].tag as i32 - ps as i32 }
-  `)
-  expect(x.size()).toBe(12)
-  x.fill()
-  expect(x.get(2)).toBe(2 + 2 + 202 + 2000)
-  expect(x.viaPtr(3)).toBe(3005)
-  expect(x.look(1)).toBe(20 + 40 + 255)
-  expect(x.raw()).toBe(0x40000000)
-  x.swap()
-  expect(x.get(0)).toBe(3 + 2 + 203 + 3005)
-  expect(x.where()).toBe(24 + 8)
-  expect(new Float32Array(x.memory.buffer, 16, 2)[0]).toBe(3)
-})
-
-test('inline functions keep constants constant', () => {
-  const x = run(`
-    inline fn sq(x: f32): f32 { return x * x }
-    inline fn clamp(x: i32, lo: i32, hi: i32): i32 { if x < lo { return lo } if x > hi { return hi } return x }
-    inline fn pow(x: i32, n: i32): i32 { return n == 0 ? 1 : x * pow(x, n - 1) }
-    inline fn countdown(n: i32): i32 { let s = 0; while n > 0 { s += n; n -= 1 } return s }
-    const K = sq(3) + 1
-    export fn a(x: f32): f32 { return sq(x + 1) }
-    export fn b(x: i32): i32 { return clamp(x, 0, 10) + clamp(x * 2, -5, 5) }
-    export fn c(x: i32): i32 { return pow(x, 5) }
-    export fn d(): f32 { return K }
-    export fn e(n: i32): i32 { return countdown(n) + countdown(3) }
-    export fn f(): i32 { let s = 0; inline for i in 0..4 { s += pow(2, i) } return s }
-  `)
-  expect(x.a(2)).toBe(9)
-  expect([x.b(-3), x.b(4), x.b(40)]).toEqual([-5, 9, 15])
-  expect(x.c(3)).toBe(243)
-  expect(x.d()).toBe(10)
-  expect(x.e(4)).toBe(16)
-  expect(x.f()).toBe(15)
-})
-
-test('comptime: constants, host functions and memory snapshots', () => {
-  const x = run(`
-    extern fn Math.sin(x: f64): f64
-    extern fn Math.tan(x: f64): f64
-    struct V2 { x: f32, y: f32 }
-    fn fib(n: i32): i32 { return n < 2 ? n : fib(n - 1) + fib(n - 2) }
-    fn polar(a: f64): V2 { return V2(sin(a) as f32, tan(a) as f32) }
-    const F20 = fib(20)
-    const DIR = polar(0.5)
-    const HALF: f64 = sin(0.5235987755982988)
-    static squares: [i32; 8] = comptime fill
-    fn fill(p: *i32) { for i in 0..8 { p[i] = i * i } }
-    export fn a(): i32 { return F20 + comptime fib(10) }
-    export fn b(): f32 { return DIR.x + DIR.y }
-    export fn c(): f64 { return HALF }
-    export fn d(i: i32): i32 { return squares[i] }
-  `)
-  expect(x.a()).toBe(6765 + 55)
-  expect(x.b()).toBe(Math.fround(Math.fround(Math.sin(0.5)) + Math.fround(Math.tan(0.5))))
-  expect(x.c()).toBeCloseTo(0.5, 12)
-  expect(x.d(7)).toBe(49)
-  // the trig ran in the compiler: the module imports nothing
-  const { wasm } = compile('m', { read: () => 'extern fn Math.sin(x: f64): f64\nconst S: f64 = sin(1.0)\nexport fn s(): f64 { return S }' })
-  expect(WebAssembly.Module.imports(new WebAssembly.Module(wasm))).toEqual([])
-})
-
-test('addresses computed at compile time match the final layout', () => {
-  const x = run(`
-    static pad: [i32; 7]
-    static a: [f32x4; 2]
-    static b: [u8; 3] = [1, 2, 3]
-    static links: [*u8; 2] = comptime link
-    const A = a as *f32
-    const LAST = &b[2]
-    fn link(out: **u8) { out[0] = b; out[1] = &b[1] }
-    export fn go(): f32 { pad[6] = 9; A[5] = 2.5; return a[1].y + LAST[0] as f32 + links[1][0] as f32 + (links[0] == b ? 100.0 : 0.0) }
-  `)
-  expect(x.go()).toBe(2.5 + 3 + 2 + 100)
-})
-
-test('for-loop counters index memory through a pre-scaled copy', () => {
-  const x = run(`
-    struct P { a: i32, b: f64 }
-    static xs: [i32; 8]
-    static ps: [P; 8]
-    static bytes: [u8; 8]
-    export fn go(from: i32, to: i32): f64 {
-      for i in 0..8 { xs[i] = i * 10; ps[i] = P(i, i as f64 * 0.5); bytes[i] = i }
-      let sum: f64 = 0.0
-      for i in from..to {
-        if i == 3 { continue }
-        let p = &ps[i]
-        for j in i..to { sum += (xs[j] + bytes[j] + p.a) as f64 + ps[j].b }
-        if xs[i] > 50 { break }
+    export function fill(): number {
+      for (let i = 0; i < 4; i++) {
+        points[i * STRIDE] = i + 0.1
+        points[i * STRIDE + 1] = 2
+        points[i * STRIDE + 2] = i * 1000
       }
-      return sum
+      return points[4] + points[9] + points.length
     }
-  `)
-  const ref = (from: number, to: number) => {
-    let sum = 0
-    for (let i = from; i < to; i++) { if (i === 3) continue; for (let j = i; j < to; j++) sum += j * 10 + j + i + j * 0.5; if (i * 10 > 50) break }
-    return sum
-  }
-  expect(x.go(0, 8)).toBe(ref(0, 8))
-  expect(x.go(2, 7)).toBe(ref(2, 7))
-  expect(x.go(5, 5)).toBe(0)
-  expect(fails('export fn a() { for i in 0..4 { i = 2 } }')).toContain('a for-loop counter cannot be assigned')
+    export function narrow(v: number): number {
+      bytes[0] = v; small[1] = v; words[2] = v; big[1] = v; wide[1] = v; small[2] = 200
+      return bytes[0] + small[1] * 10 + words[2] * 100 + big[1] * 1000 + wide[1] + small[2] + bytes[1]
+    }
+    export function look(i: i32): i32 { return table[i] + table[3] + squares[i + 4] + table.length }
+    export function update(i: i32): number { points[i] += 1.5; points[i] *= 2; points[i + 1]++; return points[i] + points[i + 1] }
+    export function walk(): i32 { let i = 0, s = 0; while (i < 4) s += table[i++] * i; return s }
+    export function views(): number {
+      const mid = points.subarray(3, 9), tail = mid.subarray(4)
+      mid[0] = 77
+      tail[1] = 88
+      return points[3] + points[8] + mid.length * 100 + tail.length * 1000
+    }
+    export function bulk(): number {
+      const a = new Float32Array(6), b = new Float32Array([1, 2, 3])
+      a.fill(9)
+      a.set(b, 2)
+      a.copyWithin(0, 3, 5)
+      a.subarray(5).fill(0.5)
+      bytes.fill(7, 1)
+      wide.fill(0)
+      return a[0] + a[1] * 10 + a[2] * 100 + a[3] * 1000 + a[4] * 1e4 + a[5] * 1e5 + bytes[0] + bytes[2] + wide[1]
+    }
+    export function fresh(n: i32): number {
+      const a = new Float64Array(n)
+      for (let i = 0; i < a.length; i++) a[i] = i / 4
+      return sumOf(a) + a.length
+    }
+    function sumOf(a: Float64Array): number { let s = 0; for (let i = 0; i < a.length; i++) s += a[i]; return s }
+  `, [['fill'], ['narrow', 300.7], ['narrow', -1.2], ['look', 1], ['update', 4], ['update', 4], ['walk'], ['views'], ['bulk'], ['fresh', 100], ['fresh', 70000]])
+  expect(r[3]).toBe(20 + 40 + 25 + 4)
+  // an exported array is the module's own memory, seen from JavaScript
+  const { wasm } = await both(`export const shared = new Float32Array(4)\nexport function set(): void { shared[2] = 6.5 }`)
+  wasm.set()
+  expect([...wasm.shared]).toEqual([0, 0, 6.5, 0])
+  wasm.shared[1] = 3
+  expect(new Float32Array(wasm.memory.buffer, wasm.shared.byteOffset, 4)[1]).toBe(3)
 })
 
-test('simd', () => {
-  const x = run(`
-    static m: [f32x4; 4]
-    static out: [f32x4; 4]
-    inline fn mul(o: *f32x4, a: *f32x4, b: *f32x4) {
-      let a0 = a[0]
-      let a1 = a[1]
-      let a2 = a[2]
-      let a3 = a[3]
-      inline for j in 0..4 {
-        let c = b[j]
-        o[j] = a0 * splat(c.x) + a1 * splat(c.y) + a2 * splat(c.z) + a3 * splat(c.w)
+test('objects with fixed fields are values', async () => {
+  await same(`
+    import type { i32 } from 'nib'
+    interface V2 { readonly x: number; readonly y: number }
+    type Box = { lo: V2, hi: V2, id: i32 }
+    let total: V2 = { x: 1, y: 2 }
+    function add(a: V2, b: V2): V2 { return { x: a.x + b.x, y: a.y + b.y } }
+    function grow(b: Box, by: number): Box { return { lo: b.lo, hi: add(b.hi, { x: by, y: by }), id: b.id + 1 } }
+    export function area(w: number, h: number): number {
+      const b = grow({ lo: { x: 0, y: 0 }, hi: { x: w, y: h }, id: 7 }, 1)
+      return (b.hi.x - b.lo.x) * (b.hi.y - b.lo.y) + b.id
+    }
+    export function accumulate(): number { total = add(total, { x: 10, y: 20 }); return total.x + total.y }
+    export function choose(first: boolean): number { const v: V2 = first ? { x: 1, y: 2 } : add(total, total); return v.x * 10 + v.y }
+    export function direct(): number { return add({ x: 1, y: 2 }, { x: 3, y: 4 }).y }
+    export function pair(a: number): V2 { return add({ x: a, y: a }, { x: 1, y: 2 }) }
+  `, [['area', 2, 3], ['accumulate'], ['accumulate'], ['choose', true], ['choose', false], ['direct'], ['pair', 5]])
+})
+
+test('functions: inlining, recursion, values and arrows', async () => {
+  await same(`
+    import type { i32 } from 'nib'
+    function square(x: number): number { return x * x }
+    /** @inline */
+    function clamp(x: i32, lo: i32, hi: i32): i32 { if (x < lo) return lo; if (x > hi) return hi; return x }
+    function power(x: i32, n: i32): i32 { return n === 0 ? 1 : x * power(x, n - 1) }
+    const K = square(3) + 1
+    export function a(x: number): number { return square(x + 1) + K }
+    export function b(x: i32): i32 { return clamp(x, 0, 10) + clamp(x * 2, -5, 5) }
+    export function c(x: i32): i32 { return power(x, 5) }
+    export function unrolled(): i32 { let s = 0; for (let i = 0; i < 4; i++) s += power(2, i); return s }
+
+    type Op = (a: number, b: number) => number
+    function plus(a: number, b: number): number { return a + b }
+    function times(a: number, b: number): number { return a * b }
+    let current: Op = plus
+    function apply(f: Op, x: number): number { return f(x, 3) + f(1, x) }
+    export function values(mul: boolean, x: number): number {
+      current = mul ? times : plus
+      const local = current
+      return apply(current, x) + local(2, 2) + apply((p: number, q: number): number => p - q, x)
+    }
+    /** @inline */
+    function twice(f: (x: number) => number, x: number): number { return f(f(x)) }
+    export function direct(x: number): number { return twice(square, x) }
+  `, [['a', 2], ['b', -3], ['b', 4], ['b', 40], ['c', 3], ['unrolled'], ['values', true, 5], ['values', false, 5], ['direct', 3]])
+})
+
+test('f32x4', async () => {
+  await same(`
+    import { f32x4 } from 'nib'
+    const m = new Float32Array(16), out = new Float32Array(16)
+    const TENTH = f32x4.splat(0.1)
+    function mul(o: Float32Array, a: Float32Array, b: Float32Array): void {
+      const a0 = f32x4.load(a, 0), a1 = f32x4.load(a, 4), a2 = f32x4.load(a, 8), a3 = f32x4.load(a, 12)
+      for (let j = 0; j < 16; j += 4) {
+        const c = f32x4.load(b, j)
+        f32x4.store(o, j, f32x4.add(f32x4.add(f32x4.mul(a0, f32x4.splat(c.x)), f32x4.mul(a1, f32x4.splat(c.y))), f32x4.add(f32x4.mul(a2, f32x4.splat(c.z)), f32x4.mul(a3, f32x4.splat(c.w)))))
       }
     }
-    export fn go(s: f32): f32 {
-      for i in 0..4 { m[i] = f32x4(s, i as f32, 0, 1) }
-      m[3] = f32x4(1, 2, 3, 4) - splat(1) * f32x4(0, 0, 0, 2)
+    export function go(s: number): number {
+      for (let i = 0; i < 4; i++) f32x4.store(m, i * 4, f32x4(s, i, 0.3, 1))
+      f32x4.store(m, 12, f32x4.sub(f32x4(1, 2, 3, 4), f32x4.mul(TENTH, f32x4(0, 0, 0, 2))))
       mul(out, m, m)
-      let v = sqrt(out[3] * out[3])
-      return v.x + v.y + v.z + v.w + max(out[0], out[1]).y
+      const v = f32x4.sqrt(f32x4.abs(f32x4.neg(f32x4.load(out, 12))))
+      const w = f32x4.div(f32x4.max(f32x4.load(out, 0), f32x4.load(out, 4)), f32x4.min(v, f32x4.splat(s)))
+      return v.x + v.y + v.z + v.w + w.y + out[5]
     }
-  `)
-  const s = 2, m = [[s, 0, 0, 1], [s, 1, 0, 1], [s, 2, 0, 1], [1, 2, 3, 2]]
-  const col = (j: number) => [0, 1, 2, 3].map(r => m[0][r] * m[j][0] + m[1][r] * m[j][1] + m[2][r] * m[j][2] + m[3][r] * m[j][3])
-  expect(x.go(s)).toBe(col(3).reduce((a, b) => a + Math.abs(b), 0) + Math.max(col(0)[1], col(1)[1]))
+    export function lanes(): Float32Array { return out }
+  `, [['go', 2], ['go', 0.37], ['lanes']])
 })
 
-test('JavaScript bindings', () => {
+test('JavaScript values: strings, objects, calls and callbacks', async () => {
   const g = globalThis as any
-  g.__seen = []
-  const x = run(`
-    extern fn Math.hypot(...): f64
-    extern new Map(): ext
-    extern call Map.set(k: any, v: any): ext as put
-    extern call Map.get(k: any): f64 as lookup
-    extern get Map.size: i32
-    extern call Array.push(...) as push
-    extern call Array.join(sep: ext): ext
-    extern val __seen: ext
-    extern new Uint8Array(buf: ext, at: i32, len: i32): ext
-    extern fn Reflect.get(o: ext, k: ext): ext as prop
-    extern get WebAssembly.Memory.buffer: ext
-    extern call Promise.then(f: func): ext
-    extern call Promise.resolve(v: any): ext as resolved
-    extern val Promise: ext
-    extern js describe(o: ext, n: i32): ext = "(o, n) => Object.keys(o).slice(0, n).join('+')"
-    static data: [u8; 4] = [7, 8, 9, 10]
-    var later = 0
-    fn onValue(v: i32) { later = v * 2 }
-    export fn peek(): i32 { return later }
-    export fn main(exports: ext): ext {
-      let m = Map()
-      put(m, "a", 1.5)
-      put(m, 2, 40)
-      let o = { name: "nib", n: size(m), list: [1, "two", 3.5], big: 4000000000 as u32 }
-      push(__seen, o, lookup(m, "a") + lookup(m, 2), hypot(3, 4), join(prop(o, "list"), "-"))
-      push(__seen, Uint8Array(buffer(prop(exports, "memory")), data as i32 + 1, 2), describe(o, 3), { fixed: [1, true, null, "s"], nested: { deep: [m] } })
-      then(resolved(Promise, 21), onValue)
-      return null
+  const run = async (which: 'wasm' | 'js') => {
+    const log: any[] = []
+    g.host = {
+      log, count: 2, label: 'ab', nothing: null,
+      box: { width: 12.5, name: 'box', tags: ['x', 'y'], add(a: number, b: number) { return a + b }, child: { depth: 3 } },
+      emit(...xs: any[]) { log.push(xs.length === 1 ? xs[0] : xs) },
+      later(f: (v: number) => void) { g.host.pending = f },
+      order(tag: string) { log.push(tag); return { then(v: number) { log.push(['then', v]) } } },
     }
-  `)
-  expect(x.main(x)).toBe(null)
-  expect(g.__seen[0]).toEqual({ name: 'nib', n: 2, list: [1, 'two', 3.5], big: 4000000000 })
-  expect(g.__seen.slice(1, 4)).toEqual([41.5, 5, '1-two-3.5'])
-  expect([...g.__seen[4]]).toEqual([8, 9])
-  expect(g.__seen[5]).toBe('name+n+list')
-  expect(g.__seen[6]).toEqual({ fixed: [1, true, null, 's'], nested: { deep: [new Map<any, any>([['a', 1.5], [2, 40]])] } })
-  // a literal is one binding: the JavaScript that builds it, constants included
-  const out = compile('m', { read: () => 'export fn f(x: i32): ext { return { size: [x, 4], label: "hi", on: true } }' })
-  expect(out.table).toEqual(['(a)=>({size:[a,4],label:"hi",on:true})'])
-  expect(WebAssembly.Module.imports(new WebAssembly.Module(out.wasm))).toEqual([{ module: out.bindings.slice(1, out.bindings.indexOf(':')), name: '0', kind: 'function' }])
-  return Promise.resolve().then(() => expect(x.peek()).toBe(42))
+    return { m: (await both(src))[which], log }
+  }
+  const src = `
+    import type { i32 } from 'nib'
+    declare const host: any
+    interface V2 { readonly x: number; readonly y: number }
+    const squares = new Float32Array([1, 4, 9])
+    let seen = 0
+    let greeting = 'hi'
+    function note(v: number): void { seen = v * 2 }
+    function bump(): number { seen++; return seen }
+    export function strings(n: i32, name: string): string { return 'n=' + n + ', ' + name.toUpperCase() + \`/\${n * 2}:\${host.label}\` + greeting }
+    export function numbers(): number {
+      const w: number = host.box.width
+      const whole: i32 = host.box.width | 0
+      const boxed = host.count                       // stays a JavaScript value until a number is needed
+      return w * 2 + whole + boxed * 10 + host.box.add(w, 1) + host.box.tags.length
+    }
+    export function objects(k: i32, v: V2): void {
+      host.emit({ kind: 'point', at: [k, k + 1], size: v, big: 4000000000, flags: { on: true, off: k > 5 }, 'needs-quotes': null })
+      host.emit(squares, squares.subarray(1), v)
+      host.box.width = k * 1.5
+      host.box.child.depth += k
+      host.count++
+      host.emit(host.box.width, host.box.child.depth, host.count)
+    }
+    export function choices(k: i32): number {
+      const missing = host.nothing?.deep?.value ?? 'fallback'
+      const kind = typeof host.box === 'object' ? 1 : 0
+      const present: boolean = host.box.child
+      const absent = !host.nothing
+      host.emit(missing, k > 2 ? 'big' : host.label, host.nothing === null, host.box !== undefined)
+      return kind + (present ? 10 : 0) + (absent ? 100 : 0) + (host.box.tags[1] === 'y' ? 1000 : 0)
+    }
+    export function callbacks(): void {
+      host.later(note)
+      host.emit(new Map([[1, 'one']]).get(1), new Date(86400000).getUTCDate(), parseInt('ff', 16), [3, 1, 2].map((x: number): number => x * 10).join('-'))
+    }
+    export function ordered(): void { host.order('first').then(bump()) }          // JavaScript's order: the call, then bump()
+    export function seenNow(): number { return seen }
+  `
+  const drive = async (which: 'wasm' | 'js') => {              // one at a time: both read the same global
+    const { m, log } = await run(which)
+    log.push(m.strings(7, 'ann'), m.numbers())
+    m.objects(3, { x: 1.5, y: -2 })
+    log.push(m.choices(1), m.choices(9))
+    m.callbacks()
+    g.host.pending(21)
+    log.push(m.seenNow())
+    m.ordered()
+    log.push(m.seenNow())
+    return { log }
+  }
+  const js = await drive('js')
+  const wasm = await drive('wasm')
+  const plain = (v: any): any => ArrayBuffer.isView(v) ? [...(v as any)] : Array.isArray(v) ? v.map(plain) : v
+  expect(wasm.log.map(plain)).toEqual(js.log.map(plain))
+  expect(js.log[0]).toBe('n=7, ANN/14:abhi')
+  expect(js.log.at(-3)).toEqual('first')
+  expect(js.log.at(-1)).toBe(43)
 })
 
-test('imports, embed and tree shaking', () => {
-  const x = run(`
-    import "lib/math"
-    import "lib/math.nib"
-    const TEXT = embed("note.txt")
-    extern call String.charCodeAt(i: i32): i32
-    export fn a(): i32 { return twice(21) + charCodeAt(TEXT, 4) }
-  `, { 'lib/math.nib': 'fn twice(x: i32): i32 { return x * 2 }\nfn unused(): i32 { return nope() }', 'note.txt': 'hello' })
-  expect(x.a()).toBe(42 + 111)
+test('bindings are written by the compiler, fused and with constants inside', async () => {
+  const { out } = await both(`
+    declare const gpu: any
+    let device: any
+    export function buffer(n: number): unknown {
+      return device.createBuffer({ size: n * 4, usage: 72, label: 'vertices' })
+    }
+    export function view(): unknown { return gpu.context.getCurrentTexture().createView() }
+    export function missing(): number { return thereIsNoSuchGlobal.value }
+    declare const thereIsNoSuchGlobal: any
+  `)
+  expect(out.glue.entries).toEqual([
+    '(a,b)=>a.createBuffer({size:b,usage:72,label:"vertices"})',
+    '()=>gpu.context.getCurrentTexture().createView()',
+    '()=>thereIsNoSuchGlobal.value',
+  ])
+  const m = instantiate(out.wasm, out.glue)                 // a missing global fails when it is used, not at load
+  expect(() => m.missing()).toThrow('thereIsNoSuchGlobal')
+})
+
+test('modules, the library, text imports and startup order', async () => {
+  const g = globalThis as any
+  const files = {
+    'main.ts': `
+      import { sin, cos, random, randomSeed, quatSpin, mat4FromQuat, mat4Mul, mat4Perspective, mat4LookAt, type Quat } from 'nib/math'
+      import { twice, LIMIT, counter, bump } from './lib/util.ts'
+      import shader from './note.wgsl' with { type: 'text' }
+      declare const trace: string[]
+      export const SIZE = LIMIT * 2
+      export const matrices = new Float32Array(48)
+      const FOCAL = 1 / Math.tan(0.4)                          // computed by the compiler
+      let rotation: Quat = { x: 0, y: 0, z: 0, w: 1 }
+      trace.push('main starts, util counter is ' + counter)
+      const startedAt = trace.length                            // needs the page: set at startup
+      export function trig(x: number): number { return sin(x) * 1000 + cos(x) }
+      export function dice(seed: number): number { randomSeed(seed); return random() + random() * 10 + random() * 100 }
+      export function spin(steps: number): Float32Array {
+        for (let i = 0; i < steps; i++) rotation = quatSpin(rotation, 0.5, 1.1, 0.3, 0.016)
+        mat4FromQuat(matrices.subarray(16, 32), rotation)
+        mat4Perspective(matrices.subarray(32, 48), FOCAL, 1.5, 0.1, 100)
+        mat4LookAt(matrices, 0, 3, 5, 0, 0, 0)
+        mat4Mul(matrices, matrices.subarray(32, 48), matrices)
+        mat4Mul(matrices, matrices, matrices.subarray(16, 32))
+        return matrices
+      }
+      export function misc(): number { bump(); return twice(SIZE) + counter + shader.length + startedAt }
+      export function text(): string { return shader }
+    `,
+    'lib/util.ts': `
+      declare const trace: string[]
+      export const LIMIT = 21
+      export let counter = 5
+      export function twice(x: number): number { return x * 2 }
+      export function bump(): void { counter++ }
+      function unused(): number { return notCompiledSoNotChecked() }
+      declare function notCompiledSoNotChecked(): number
+      trace.push('util starts')
+    `,
+    'note.wgsl': '// a comment\nfn main() -> f32 {\n  return 1.0;\n}\n',
+  }
+  g.trace = []
+  const { wasm, js, out } = await both(files)             // each one runs its top level once, imports first
+  expect(g.trace).toEqual(['util starts', 'main starts, util counter is 5', 'util starts', 'main starts, util counter is 5'])
+  for (const x of [0, 0.5, -2, 100.25, 1e6]) expect(wasm.trig(x)).toBe(js.trig(x))
+  expect(Math.abs(js.trig(1) - (Math.sin(1) * 1000 + Math.cos(1)))).toBeLessThan(1e-6)
+  expect(wasm.dice(42)).toBe(js.dice(42))
+  expect([...wasm.spin(100)]).toEqual([...js.spin(100)])
+  expect(wasm.misc()).toBe(js.misc())
+  expect([wasm.SIZE, wasm.matrices.length, wasm.text()]).toEqual([42, 48, files['note.wgsl']])
+  expect(out.files.map(f => f.replace(/.*\/(lib|\d+)\//, '$1/'))).toContain('lib/math.ts')
 })
 
 test('errors point at the source', () => {
-  expect(fails('export fn a(): i32 { return 1.5 }')).toContain('main.nib:1:29: expected i32, found float literal')
-  expect(fails('export fn a(x: i32): f32 { return x }')).toContain('expected f32, found i32')
-  expect(fails('export fn a() { b() }')).toContain("unknown function 'b'")
-  expect(fails('export fn a(x: i32) { let p = &x }')).toContain('locals have no address')
-  expect(fails('const A = A + 1\nexport fn a(): i32 { return A }')).toContain('depends on itself')
-  expect(fails('export fn a(x: i32, y: f32): f32 { return x * y }')).toContain('mismatched types: i32 * f32')
-  expect(fails('export fn a() { break }')).toContain('break outside a loop')
-  expect(fails('export fn a() {\n  let x = \n}')).toContain("main.nib:3:1: unexpected '}'")
-})
-
-test('assorted code generation paths agree with JavaScript', () => {
-  const x = run(`
-    struct P { a: i16, b: i8, c: f32 }
-    static ps: [P; 16]
-    static src: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8]
-    static dst: [u8; 8]
-    var calls = 0
-    fn tick(v: bool): bool { calls += 1; return v }
-    export fn compound(j: i32, v: i32): i32 {
-      let p = ps as *i16
-      p[j * 4 + 1] = -5
-      p[j * 4 + 1] += v
-      p[j * 4 + 1] *= 3
-      ps[j + 1] = P(-300, -7, 1.5)
-      ps[j + 1].c += 2.0
-      return p[j * 4 + 1] + ps[j + 1].a + ps[j + 1].b + ps[j + 1].c as i32
-    }
-    export fn circuit(a: bool, b: bool): i32 {
-      calls = 0
-      let r = (tick(a) && tick(b)) || (tick(!a) && tick(!b))
-      return calls * 10 + r as i32
-    }
-    export fn clamp(v: i32, lo: i32, hi: i32): i32 { return min(max(v, lo), hi) }
-    export fn umax(a: u32, b: u32): u32 { return max(a, b) }
-    export fn wide(a: i64, b: i64): i64 { return (a << 3 ^ b) / 7 + (a > b ? 1 : 0) as i64 - clz(b) }
-    export fn copy(): i32 { memcopy(dst, &src[2], 4); memfill(&dst[4], 9, 3); return dst[0] + dst[3] * 10 + dst[6] * 100 + dst[7] * 1000 }
-    export fn count(n: u32): u32 { let c: u32 = 0; let i: u32 = 0; while i < n { i += 1; if i % 3 == 0 { continue } c += i } return c }
-    export fn nulls(): i32 { let e: ext = null; return isnull(e) as i32 + (isnull("s") ? 10 : 20) }
-    export fn twice(v: f64): f64 { return 2.0 * v }
-    export fn half(v: f64): f64 { return v / 2.0 }
-    export fn eighth(v: f32): f32 { return (v + 0.0) / 8.0 }
-    export fn third(v: f64): f64 { return v / 3.0 }
-    export fn bits(v: u32): u32 { return popcnt(v) + ctz(v) * 100 + (~v >> 28) * 10000 }
-  `)
-  expect(x.compound(2, 12)).toBe((-5 + 12) * 3 + -300 + -7 + 3)
-  expect([x.circuit(1, 1), x.circuit(1, 0), x.circuit(0, 0), x.circuit(0, 1)]).toEqual([21, 30, 31, 30])
-  expect([x.clamp(5, 0, 3), x.clamp(-5, 0, 3), x.clamp(2, 0, 3)]).toEqual([3, 0, 2])
-  expect(x.umax(-1, 5) >>> 0).toBe(0xffffffff)
-  expect(x.wide(1000n, -3n)).toBe(((1000n << 3n) ^ -3n) / 7n + 1n - 0n)
-  expect(x.copy()).toBe(3 + 6 * 10 + 9 * 100 + 0)
-  let c = 0; for (let i = 1; i <= 100; i++) if (i % 3) c += i
-  expect(x.count(100)).toBe(c)
-  expect(x.nulls()).toBe(21)
-  expect(x.bits(0x00f0)).toBe(4 + 400 + 15 * 10000)
-  expect([x.twice(0.1), x.twice(-Infinity), x.half(0.3), x.half(5e-324), x.eighth(3), x.third(1)]).toEqual([0.2, -Infinity, 0.15, 5e-324 / 2, Math.fround(3 / 8), 1 / 3])
-  expect(x.twice(NaN)).toBeNaN()
-})
-
-test('bindings are a static table, and missing APIs fail only when used', () => {
-  const src = `
-    extern fn no.such.thing(x: i32): i32
-    extern fn Math.max(a: i32, b: i32): i32 as biggest
-    extern val also.missing: ext
-    extern fn Boolean(v: any): bool
-    extern call String.toUpperCase(): ext
-    export fn ok(): i32 { return biggest(3, 9) + (Boolean(missing) ? 100 : 0) }
-    export fn shout(): ext { return toUpperCase("abc") }
-    export fn bad(): i32 { return thing(1) }
-  `
-  const out = compile('m', { read: () => src })
-  expect(out.table).toEqual(['globalThis.Math?.max||F', 'globalThis.Boolean||F', '(a)=>a.toUpperCase()', 'globalThis.no?.such?.thing||F', 'globalThis.also?.missing', '"abc"'])
-  expect(out.bindings).not.toContain('eval')
-  const x = instantiate(out.wasm, out.bindings).exports as any
-  expect(x.ok()).toBe(9)
-  expect(x.shout()).toBe('ABC')
-  expect(() => x.bad()).toThrow('nib: missing binding')
-})
-
-test('memory builtins', () => {
-  const x = run(`
-    static pad: [u8; 100]
-    export fn base(): i32 { return heap_base() }
-    export fn pages(): i32 { return memory_pages() }
-    export fn grow(n: i32): i32 { return memory_grow(n) }
-    export fn poke(): i32 { pad[99] = 7; let p = (heap_base() + 70000) as *i32; p[0] = 5; return p[0] + pad[99] }
-  `)
-  expect(x.base()).toBe(128)
-  expect(x.pages()).toBe(1)
-  expect(x.grow(2)).toBe(1)
-  expect(x.pages()).toBe(3)
-  expect(x.poke()).toBe(12)
-})
-
-test('std/mem: blocks, arenas, lists and the buffer JavaScript sees', () => {
-  const x = run(`
-    import "std/mem"
-    struct Item { id: i32, v: f64 }
-    static items: [List; 1]
-    static scratch: [Arena; 1]
-    export fn main(exports: ext) { memory_bind(exports) }
-    export fn blocks(): i32 {
-      let p = alloc(100)
-      let q = alloc(100)
-      free(p, 100)
-      let r = alloc(120)                      // the same size class as 100: reuses p
-      let s = alloc(20)
-      return (r == p) as i32 + (q - p == 128) as i32 * 10 + (p & 15 == 0) as i32 * 100 + (s != p && s != q) as i32 * 1000
-    }
-    export fn big(): i32 {
-      let before = memory_pages()
-      let p = alloc(3000000) as *u8
-      p[2999999] = 7
-      return (memory_pages() - before) * 10 + p[2999999]
-    }
-    export fn arena(): i32 {
-      arena_init(scratch, 1024)
-      let a = arena_alloc(scratch, 10)
-      let b = arena_alloc(scratch, 40)
-      arena_reset(scratch)
-      return (b - a) + (arena_alloc(scratch, 8) == a) as i32 * 1000
-    }
-    export fn list(n: i32): f64 {
-      list_init(items, sizeof(Item), 4)
-      for i in 0..n {
-        let it = list_add(items) as *Item          // grows from 4 as needed
-        it.id = i
-        it.v = i as f64 * 0.5
-      }
-      let i = items.count
-      while i > 0 {                                // drop every third item
-        i -= 1
-        if (items.items as *Item)[i].id % 3 == 0 { list_remove(items, i) }
-      }
-      let all = items.items as *Item
-      let sum: f64 = 0.0
-      for j in 0..items.count { sum += all[j].v + all[j].id as f64 * 1000.0 }
-      return sum + items.count as f64 * 1000000.0
-    }
-    export fn buffer_now(): ext { return memory_buffer() }
-  `)
-  x.main(x)
-  const first = x.buffer_now()
-  expect(first).toBe(x.memory.buffer)
-  expect(x.buffer_now()).toBe(first)               // no growth: the same object, no call into JavaScript needed
-  expect(x.blocks()).toBe(1111)
-  expect(x.big()).toBeGreaterThanOrEqual(640 - 160 + 7)
-  expect(first.byteLength).toBe(0)                 // growing detached the old buffer...
-  expect(x.buffer_now()).toBe(x.memory.buffer)     // ...and the next request fetched the new one
-  expect(x.arena()).toBe(16 + 1000)
-  let sum = 0, count = 0
-  for (let i = 0; i < 100; i++) if (i % 3) { sum += i * 0.5 + i * 1000; count++ }
-  expect(x.list(100)).toBe(sum + count * 1000000)
-})
-
-test('std/input and std/loop: actions, edges and fixed ticks', () => {
-  const g = globalThis as any, listeners: Record<string, Function> = {}
-  const target = { addEventListener: (type: string, f: Function) => { listeners[type] = f }, setPointerCapture() {} }
-  let frame: Function = () => {}
-  g.window = target
-  g.requestAnimationFrame = (f: Function) => { frame = f; return 1 }
-  const x = run(`
-    import "std/input"
-    import "std/loop"
-    const LEFT = 1
-    const JUMP = 2
-    var ticks = 0
-    var jumps = 0
-    var left_ticks = 0
-    var drawn: f32 = 0
-    var taps = 0
-    fn update(dt: f32) {
-      ticks += 1
-      if hit(JUMP) { jumps += 1 }
-      if held(LEFT) { left_ticks += 1 }
-      if pointer_hit { taps += 1 }
-    }
-    fn render(blend: f32) { drawn = blend }
-    export fn main(surface: ext) {
-      input_init(surface, { KeyA: LEFT, ArrowLeft: LEFT, Space: JUMP })
-      loop_start()
-    }
-    export fn read(what: i32): f32 {
-      return what == 0 ? ticks as f32 : what == 1 ? jumps as f32 : what == 2 ? left_ticks as f32 : what == 3 ? drawn : what == 4 ? taps as f32 : pointer_x
-    }
-  `)
-  x.main(target)
-  const key = (type: string, code: string, extra = {}) => { let stopped = false; listeners[type]({ code, preventDefault() { stopped = true }, ctrlKey: false, metaKey: false, ...extra }); return stopped }
-  frame(1000)                                              // the first frame only starts the clock
-  expect(key('keydown', 'Space')).toBe(true)               // mapped keys do not scroll the page
-  expect(key('keydown', 'Space')).toBe(true)               // auto-repeat: still held, not hit again
-  expect(key('keydown', 'KeyQ')).toBe(false)               // unmapped keys are left alone
-  expect(key('keydown', 'KeyA', { ctrlKey: true })).toBe(false)
-  frame(1017)                                              // 17 ms: two 120 Hz ticks, a little left over
-  expect([x.read(0), x.read(1), x.read(2)]).toEqual([2, 1, 0])
-  key('keydown', 'ArrowLeft'); key('keyup', 'Space')
-  listeners.pointerdown({ target, pointerId: 1, offsetX: 42.5, offsetY: 7 })
-  frame(1042.5)                                            // a slow frame: three more ticks
-  expect([x.read(0), x.read(1), x.read(2), x.read(4), x.read(5)]).toEqual([5, 1, 3, 1, 42.5])
-  expect(x.read(3)).toBeCloseTo(0.1, 3)                    // 42.5 ms is five ticks and a tenth: draw a tenth of the way on
-  listeners.blur()                                         // focus lost: nothing stays held
-  frame(6042.5)                                            // a long pause is capped at 0.1 s
-  expect([x.read(0), x.read(2)]).toEqual([5 + 12, 3])
+  expect(fails('export function a(): i32 { return 1.5 }')).toContain('main.ts:1:35: expected i32, found number: write `| 0` to truncate')
+  expect(fails('export function a(x: number): i32 { return x }')).toContain('expected i32, found number')
+  expect(fails('export function a(x: i32): f32 { return x / 3 }')).toContain('write Math.fround(...)')
+  expect(fails('export function a(x: number) { return x }')).toContain("function 'a' needs a return type")
+  expect(fails('export function a(): void { const p = { x: 1 }; let q: { x: number } = { x: 2 }; q.x = 3 }')).toContain('objects are values here')
+  expect(fails('const A: number = A + 1\nexport function a(): number { return A }')).toContain('depends on itself')
+  expect(fails('export function a(): void { break }')).toContain('break outside a loop')
+  expect(fails('export function a(): void {\n  let x = \n}')).toContain("main.ts:3:1: unexpected '}'")
+  expect(fails('function make(n: number): () => number { return () => n }\nexport function a(): number { return make(1)() }')).toContain('closures are not supported')
+  expect(fails('class A {}')).toContain("'class' is not supported")
+  expect(fails('export function a(xs: number[]): void { for (const x of xs) {} }')).toContain('for...of')
+  expect(fails('export const a = document.title')).toContain("'a' cannot be exported to JavaScript")
 })

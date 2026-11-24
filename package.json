@@ -1,13 +1,23 @@
 {
   "name": "nib",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "private": true,
   "bin": { "nib": "nib/cli.ts" },
+  "exports": {
+    ".": "./lib/index.ts",
+    "./*": "./lib/*.ts"
+  },
   "scripts": {
     "dev": "bun nib/cli.ts dev examples",
     "build": "bun nib/cli.ts build examples --out dist",
     "test": "bun test",
+    "check": "tsc --noEmit",
     "bench": "bun bench/run.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@webgpu/types": "latest",
+    "typescript": "latest"
   }
 }

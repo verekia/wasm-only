@@ -1,4 +1,6 @@
-// Lexer and parser. Produces plain-object AST nodes: { n: kind, pos, ... }.
+// Lexer and parser for the subset of TypeScript that Nib compiles. Produces plain-object AST
+// nodes: { n: kind, pos, ... }. Anything outside the subset is a syntax error here, so a file
+// that parses is also valid TypeScript.
 
 export interface File { path: string; src: string }
 export class NibError extends Error {}
@@ -10,253 +12,425 @@ export function fail(msg: string, at?: { file?: File; pos: number }): never {
   throw new NibError(`${at.file.path}:${line}:${col}: ${msg}`)
 }
 
-interface Tok { k: 'id' | 'num' | 'str' | 'op' | 'eof'; v: string; pos: number; nl: boolean }
+interface Tok {
+  k: 'id' | 'num' | 'str' | 'tpl' | 'op' | 'eof'
+  v: string
+  pos: number
+  nl: boolean                 // a line break came before this token
+  inline?: boolean            // a comment with @inline came before this token
+  quasis?: string[]           // template literal: the text parts...
+  holes?: { src: string; pos: number }[]   // ...and the source of each ${ }
+}
 
 const TOKEN = new RegExp([
-  /[ \t\r]+|\/\/[^\n]*/,                                              // skipped
-  /(\n)/,                                                              // 1 newline
-  /([A-Za-z_]\w*)/,                                                    // 2 identifier
-  /(0x[\da-fA-F_]+|\d[\d_]*(?:\.\d[\d_]*)?(?:[eE][-+]?\d+)?)/,          // 3 number
-  /"((?:[^"\\\n]|\\.)*)"/,                                             // 4 string
-  /`([^`]*)`/,                                                         // 5 raw string
-  /(\.\.\.|<<=|>>=|\.\.|&&|\|\||<<|>>|[-+*\/%&|^=!<>]=|[-+*\/%&|^~!<>=(){}\[\],.:;?])/, // 6 operator
+  /[ \t\r]+/,                                                                          // skipped
+  /(\n)/,                                                                               // 1 newline
+  /(\/\/[^\n]*|\/\*[^]*?\*\/)/,                                                         // 2 comment
+  /([A-Za-z_$][\w$]*)/,                                                                 // 3 identifier
+  /(0[xX][\da-fA-F_]+|0[bB][01_]+|(?:\d[\d_]*(?:\.[\d_]*)?|\.\d[\d_]*)(?:[eE][-+]?\d+)?)/, // 4 number
+  /'((?:[^'\\\n]|\\[^])*)'/,                                                            // 5 string
+  /"((?:[^"\\\n]|\\[^])*)"/,                                                            // 6 string
+  /(>>>=|\.\.\.|===|!==|\*\*=|<<=|>>=|>>>|&&=|\|\|=|\?\?=|=>|==|!=|<=|>=|&&|\|\||\?\?|\?\.(?!\d)|\+\+|--|[-+*\/%&|^]=|<<|>>|\*\*|[{}()\[\];,<>+\-*\/%&|^!~?:=.@])/, // 7 operator
 ].map(r => r.source).join('|'), 'y')
 
-function lex(file: File): Tok[] {
-  const src = file.src, toks: Tok[] = []
-  let pos = 0, nl = true
+const ESCAPES: Record<string, string> = { n: '\n', t: '\t', r: '\r', b: '\b', f: '\f', v: '\v', 0: '\0' }
+const unescape = (s: string) => s.replace(/\\(?:u\{([\da-fA-F]+)\}|u([\da-fA-F]{4})|x([\da-fA-F]{2})|\r?\n|([^]))/g,
+  (_, u1, u2, x, c) => u1 ?? u2 ?? x ? String.fromCodePoint(parseInt(u1 ?? u2 ?? x, 16)) : c === undefined ? '' : ESCAPES[c] ?? c)
+
+function lex(file: File, src = file.src, base = 0): Tok[] {
+  const toks: Tok[] = []
+  let pos = 0, nl = true, inline = false
+  const push = (t: Omit<Tok, 'nl' | 'pos'>, at: number) => { toks.push({ ...t, pos: base + at, nl, ...(inline && { inline }) }); nl = inline = false }
   while (pos < src.length) {
+    if (src[pos] === '`') {                       // template literal: split text and ${ } holes by hand
+      const quasis: string[] = [], holes: { src: string; pos: number }[] = [], start = pos
+      let text = ''
+      for (pos++; ; pos++) {
+        if (pos >= src.length) fail('unterminated template literal', { file, pos: base + start })
+        const c = src[pos]
+        if (c === '`') break
+        if (c === '\\') { text += src[pos] + src[++pos]; continue }
+        if (c === '$' && src[pos + 1] === '{') {
+          let depth = 1, i = pos + 2
+          for (; depth; i++) {
+            if (i >= src.length) fail('unterminated ${ in a template literal', { file, pos: base + pos })
+            if (src[i] === '{') depth++
+            else if (src[i] === '}') depth--
+          }
+          quasis.push(unescape(text)); text = ''
+          holes.push({ src: src.slice(pos + 2, i - 1), pos: base + pos + 2 })
+          pos = i - 1
+          continue
+        }
+        text += c
+      }
+      quasis.push(unescape(text))
+      push({ k: 'tpl', v: '`', quasis, holes }, start)
+      pos++
+      continue
+    }
     TOKEN.lastIndex = pos
     const m = TOKEN.exec(src)
-    if (!m) fail(`unexpected character '${src[pos]}'`, { file, pos })
+    if (!m) fail(`unexpected character '${src[pos]}'`, { file, pos: base + pos })
     if (m[1]) nl = true
-    else if (m[2] !== undefined) toks.push({ k: 'id', v: m[2], pos, nl })
-    else if (m[3] !== undefined) toks.push({ k: 'num', v: m[3].replaceAll('_', ''), pos, nl })
-    else if (m[4] !== undefined) toks.push({ k: 'str', v: JSON.parse(`"${m[4]}"`), pos, nl })
-    else if (m[5] !== undefined) toks.push({ k: 'str', v: m[5], pos, nl })
-    else if (m[6] !== undefined) toks.push({ k: 'op', v: m[6], pos, nl })
-    if (m[0] !== '\n' && (m[2] ?? m[3] ?? m[4] ?? m[5] ?? m[6]) !== undefined) nl = false
+    else if (m[2]) { if (m[2].includes('\n')) nl = true; if (m[2].includes('@inline')) inline = true }
+    else if (m[3] !== undefined) push({ k: 'id', v: m[3] }, pos)
+    else if (m[4] !== undefined) push({ k: 'num', v: m[4].replaceAll('_', '') }, pos)
+    else if (m[5] !== undefined || m[6] !== undefined) push({ k: 'str', v: unescape(m[5] ?? m[6]) }, pos)
+    else if (m[7] !== undefined) push({ k: 'op', v: m[7] }, pos)
     pos = TOKEN.lastIndex
   }
-  toks.push({ k: 'eof', v: '<end of file>', pos, nl: true })
+  toks.push({ k: 'eof', v: '<end of file>', pos: base + src.length, nl: true })
   return toks
 }
 
+// JavaScript's binary operators, loosest first.
 const PREC: Record<string, number> = {
-  '||': 1, '&&': 2, '==': 3, '!=': 3, '<': 3, '<=': 3, '>': 3, '>=': 3,
-  '|': 4, '^': 5, '&': 6, '<<': 7, '>>': 7, '+': 8, '-': 8, '*': 9, '/': 9, '%': 9,
+  '??': 1, '||': 2, '&&': 3, '|': 4, '^': 5, '&': 6, '==': 7, '!=': 7, '===': 7, '!==': 7,
+  '<': 8, '<=': 8, '>': 8, '>=': 8, '<<': 9, '>>': 9, '>>>': 9, '+': 10, '-': 10, '*': 11, '/': 11, '%': 11,
 }
-const ASSIGN = new Set(['=', '+=', '-=', '*=', '/=', '%=', '&=', '|=', '^=', '<<=', '>>='])
-const EXTERN_KINDS = new Set(['fn', 'call', 'get', 'set', 'new', 'val', 'js'])
+const ASSIGN = new Set(['=', '+=', '-=', '*=', '/=', '%=', '&=', '|=', '^=', '<<=', '>>=', '>>>='])
+const RESERVED = new Set(['function', 'const', 'let', 'var', 'if', 'else', 'for', 'while', 'do', 'return', 'break', 'continue',
+  'import', 'export', 'new', 'typeof', 'class', 'switch', 'throw', 'try', 'interface', 'type', 'async', 'await', 'yield', 'delete', 'in', 'of'])
 
-export function parse(file: File): { imports: { path: string; pos: number }[]; decls: any[] } {
-  const toks = lex(file)
-  let i = 0
-  const peek = () => toks[i]
-  const err = (msg: string, t = toks[i]): never => fail(msg, { file, pos: t.pos })
-  const is = (v: string) => toks[i].v === v && toks[i].k !== 'str'
-  const eat = (v: string) => is(v) && (i++, true)
-  const expect = (v: string) => { if (!eat(v)) err(`expected '${v}', found '${toks[i].v}'`) }
-  const ident = () => { const t = toks[i]; if (t.k !== 'id') err(`expected a name, found '${t.v}'`); i++; return t.v }
-  const sep = () => { while (eat(',') || eat(';')); }
+export interface Ast {
+  imports: { names: { name: string; as: string }[]; default?: string; from: string; pos: number }[]
+  top: any[]                 // declarations and statements, in source order
+}
 
-  function type(): any {
-    const pos = peek().pos
-    if (eat('*')) return { n: 'tptr', pos, to: type() }
-    return { n: 'tname', pos, name: ident() }
+export function parse(file: File): Ast {
+  return new Parser(file, lex(file)).program()
+}
+
+class Parser {
+  private i = 0
+  constructor(private file: File, private toks: Tok[]) {}
+
+  private get t() { return this.toks[this.i] }
+  private err(msg: string, t = this.t): never { return fail(msg, { file: this.file, pos: t.pos }) }
+  private is(v: string, ahead = 0) { const t = this.toks[this.i + ahead]; return t.v === v && (t.k === 'op' || t.k === 'id') }
+  private eat(v: string) { return this.is(v) && (this.i++, true) }
+  private expect(v: string) { if (!this.eat(v)) this.err(`expected '${v}', found '${this.t.v}'`) }
+  private ident() { const t = this.t; if (t.k !== 'id') this.err(`expected a name, found '${t.v}'`); this.i++; return t.v }
+  private semi() { while (this.eat(';')); }
+  /** Runs `f`; if it throws a syntax error, rewinds and returns undefined. */
+  private attempt<X>(f: () => X): X | undefined {
+    const at = this.i
+    try { return f() } catch (e) { if (!(e instanceof NibError)) throw e; this.i = at; return undefined }
   }
 
-  // ---- expressions ----
-  function expr(): any {
-    const c = binary(1)
-    if (!eat('?')) return c
-    const a = expr(); expect(':')
-    return { n: 'cond', pos: c.pos, c, a, b: expr() }
+  // ---- types
+
+  type(): any {
+    const pos = this.t.pos
+    this.eat('|')
+    const parts = [this.typePostfix()]
+    while (this.is('|') || this.is('&')) { this.i++; parts.push(this.typePostfix()) }
+    return parts.length === 1 ? parts[0] : { n: 'tunion', pos, types: parts }
   }
-  function binary(min: number): any {
-    let a = unary()
-    for (;;) {
-      const t = peek(), p = t.k === 'op' && !t.nl ? PREC[t.v] : undefined   // an operator starting a line does not continue
-      if (!p || p < min) return a
-      i++
-      a = { n: 'bin', pos: t.pos, op: t.v, a, b: binary(p + 1) }
-    }
+  private typePostfix(): any {
+    let t = this.typePrimary()
+    while (this.is('[') && this.is(']', 1)) { this.i += 2; t = { n: 'tother', pos: t.pos } }     // T[] is a JavaScript array
+    return t
   }
-  function unary(): any {           // `as` binds looser than prefix operators: `-x as f32` is `(-x) as f32`
-    const pos = peek().pos
-    let e = prefix()
-    while (eat('as')) e = { n: 'cast', pos, e, t: type() }
-    return e
-  }
-  function prefix(): any {
-    const t = peek()
-    if (t.k === 'op' && (t.v === '-' || t.v === '!' || t.v === '~')) { i++; return { n: 'un', pos: t.pos, op: t.v, e: prefix() } }
-    if (t.k === 'op' && t.v === '&') { i++; return { n: 'addr', pos: t.pos, e: prefix() } }
-    if (eat('comptime')) return { n: 'comptime', pos: t.pos, e: prefix() }
-    return postfix()
-  }
-  function postfix(): any {
-    let e = primary()
-    for (;;) {
-      const t = peek()
-      if (t.k !== 'op') return e
-      if (t.v === '(' && !t.nl && e.n === 'id') {
-        i++
-        const args: any[] = []
-        while (!eat(')')) { args.push(expr()); if (!is(')')) expect(',') }
-        e = { n: 'call', pos: e.pos, name: e.name, args }
-      } else if (t.v === '[' && !t.nl) {
-        i++
-        const ix = expr(); expect(']')
-        e = { n: 'idx', pos: t.pos, e, i: ix }
-      } else if (t.v === '.') {
-        i++
-        e = { n: 'fld', pos: t.pos, e, name: ident() }
-      } else return e
-    }
-  }
-  function primary(): any {
-    const t = toks[i++]
-    switch (t.k) {
-      case 'num': {
-        const float = !t.v.startsWith('0x') && /[.eE]/.test(t.v)
-        return { n: 'num', pos: t.pos, v: Number(t.v), float }
+  private typePrimary(): any {
+    const t = this.t, pos = t.pos
+    if (t.k === 'str' || t.k === 'num' || t.k === 'tpl') { this.i++; return { n: 'tother', pos } }
+    if (this.eat('{')) {
+      const fields: any[] = []
+      while (!this.eat('}')) {
+        this.eat('readonly')
+        const name = this.ident(), optional = this.eat('?')
+        this.expect(':')
+        fields.push({ name, t: optional ? { n: 'tother', pos } : this.type() })
+        if (!this.eat(',')) this.eat(';')
       }
-      case 'str': return { n: 'str', pos: t.pos, v: t.v }
-      case 'id':
-        if (t.v === 'true' || t.v === 'false') return { n: 'bool', pos: t.pos, v: t.v === 'true' }
-        if (t.v === 'null') return { n: 'null', pos: t.pos }
-        return { n: 'id', pos: t.pos, name: t.v }
-      case 'op':
-        if (t.v === '(') { const e = expr(); expect(')'); return e }
-        if (t.v === '{') {                         // JS object literal
-          const props: [string, any][] = []
-          for (sep(); !eat('}'); sep()) {
-            const k = toks[i++]
-            if (k.k !== 'id' && k.k !== 'str') err('expected a property name', k)
-            props.push([k.v, eat(':') ? expr() : { n: 'id', pos: k.pos, name: k.v }])
-          }
-          return { n: 'obj', pos: t.pos, props }
-        }
-        if (t.v === '[') {                         // JS array literal
-          const items: any[] = []
-          for (sep(); !eat(']'); sep()) items.push(expr())
-          return { n: 'arr', pos: t.pos, items }
-        }
+      return { n: 'tobj', pos, fields }
     }
-    return err(`unexpected '${t.v}'`, t)
+    if (this.is('(')) {
+      const fn = this.attempt(() => { const params = this.params(); this.expect('=>'); return { n: 'tfn', pos, params, ret: this.type() } })
+      if (fn) return fn
+      this.i++
+      const inner = this.type()
+      this.expect(')')
+      return inner
+    }
+    if (this.eat('[')) { while (!this.eat(']')) { this.type(); this.eat(',') } return { n: 'tother', pos } }
+    if (this.eat('typeof') || this.eat('keyof') || this.eat('readonly')) { this.typePostfix(); return { n: 'tother', pos } }
+    let name = this.ident()
+    while (this.eat('.')) name += '.' + this.ident()
+    if (this.eat('<')) { do this.type(); while (this.eat(',')); this.expect('>') }
+    return { n: 'tname', pos, name }
   }
-
-  // ---- statements ----
-  function block(): any[] {
-    expect('{')
+  private params(): any[] {
     const out: any[] = []
-    for (sep(); !eat('}'); sep()) out.push(stmt())
+    this.expect('(')
+    while (!this.eat(')')) {
+      const pos = this.t.pos, name = this.ident()
+      if (this.is('?') || this.is('=')) this.err('optional and default parameters are not supported')
+      out.push({ name, pos, t: this.eat(':') ? this.type() : null })
+      if (!this.is(')')) this.expect(',')
+    }
     return out
   }
-  function stmt(): any {
-    const t = peek(), pos = t.pos
-    if (eat('let')) {
-      const name = ident(), ty = eat(':') ? type() : null
-      expect('=')
-      return { n: 'let', pos, name, t: ty, e: expr() }
+
+  // ---- expressions
+
+  expr(): any {
+    const c = this.binary(1)
+    if (!this.eat('?')) return c
+    const a = this.expr()
+    this.expect(':')
+    return { n: 'cond', pos: c.pos, c, a, b: this.expr() }
+  }
+  private binary(min: number): any {
+    let a = this.unary()
+    for (;;) {
+      const t = this.t
+      if (t.k === 'id' && (t.v === 'as' || t.v === 'satisfies') && min <= 8) {        // binds like a comparison
+        this.i++
+        a = t.v === 'as' ? { n: 'as', pos: t.pos, e: a, t: this.type() } : (this.type(), a)
+        continue
+      }
+      const p = t.k === 'op' ? PREC[t.v] : undefined
+      if (!p || p < min) return a
+      this.i++
+      a = { n: 'bin', pos: t.pos, op: t.v, a, b: this.binary(p + 1) }
     }
-    if (eat('if')) {
-      const c = expr(), then = block()
-      const els = eat('else') ? (is('if') ? [stmt()] : block()) : null
-      return { n: 'if', pos, c, then, else: els }
+  }
+  private unary(): any {
+    const t = this.t
+    if (t.k === 'op' && (t.v === '-' || t.v === '+' || t.v === '!' || t.v === '~')) { this.i++; return { n: 'un', pos: t.pos, op: t.v, e: this.unary() } }
+    if (t.k === 'op' && (t.v === '++' || t.v === '--')) { this.i++; return { n: 'incr', pos: t.pos, e: this.unary(), d: t.v === '++' ? 1 : -1, prefix: true } }
+    if (t.k === 'id' && t.v === 'typeof') { this.i++; return { n: 'un', pos: t.pos, op: 'typeof ', e: this.unary() } }
+    if (t.k === 'id' && (t.v === 'await' || t.v === 'delete' || t.v === 'void')) this.err(`'${t.v}' is not supported`)
+    const e = this.postfix()
+    const p = this.t
+    if (p.k === 'op' && (p.v === '++' || p.v === '--') && !p.nl) { this.i++; return { n: 'incr', pos: p.pos, e, d: p.v === '++' ? 1 : -1, prefix: false } }
+    return e
+  }
+  private args(): any[] {
+    const out: any[] = []
+    while (!this.eat(')')) {
+      if (this.is('...')) this.err('spread arguments are not supported')
+      out.push(this.expr())
+      if (!this.is(')')) this.expect(',')
     }
-    if (eat('while')) return { n: 'while', pos, c: expr(), body: block() }
-    if (eat('loop')) return { n: 'while', pos, c: { n: 'bool', pos, v: true }, body: block() }
-    if (is('for') || (is('inline') && toks[i + 1].v === 'for')) {
-      const inline = eat('inline'); i++
-      const name = ident(); expect('in')
-      const a = expr(); expect('..')
-      return { n: 'for', pos, inline, name, a, b: expr(), body: block() }
+    return out
+  }
+  private postfix(): any {
+    let e = this.primary()
+    for (;;) {
+      const t = this.t
+      if (t.k === 'tpl') this.err('tagged templates are not supported')
+      if (t.k !== 'op') return e
+      if (t.v === '(') { this.i++; e = { n: 'call', pos: e.pos, f: e, args: this.args() } }
+      else if (t.v === '[') { this.i++; const ix = this.expr(); this.expect(']'); e = { n: 'idx', pos: t.pos, e, i: ix } }
+      else if (t.v === '.') { this.i++; e = { n: 'fld', pos: t.pos, e, name: this.ident() } }
+      else if (t.v === '?.') {
+        this.i++
+        if (this.eat('(')) e = { n: 'call', pos: e.pos, f: e, args: this.args(), opt: true }
+        else if (this.eat('[')) { const ix = this.expr(); this.expect(']'); e = { n: 'idx', pos: t.pos, e, i: ix, opt: true } }
+        else e = { n: 'fld', pos: t.pos, e, name: this.ident(), opt: true }
+      }
+      else if (t.v === '!' && !t.nl && !this.is('=', 1)) this.i++                     // non-null assertion: types only
+      else if (t.v === '<') {                                                        // f<T>(x): type arguments, if it parses as such
+        const typed = this.attempt(() => { this.i++; do this.type(); while (this.eat(',')); this.expect('>'); if (!this.is('(')) this.err('not a call'); return true })
+        if (!typed) return e
+      }
+      else return e
     }
-    if (eat('break')) return { n: 'break', pos }
-    if (eat('continue')) return { n: 'continue', pos }
-    if (eat('return')) return { n: 'return', pos, e: peek().nl || is('}') ? null : expr() }
-    const e = expr(), op = peek()
-    if (op.k === 'op' && ASSIGN.has(op.v)) { i++; return { n: 'assign', pos, op: op.v, to: e, e: expr() } }
+  }
+  private arrow(pos: number): any {
+    const params = this.is('(') ? this.params() : [{ name: this.ident(), pos, t: null }]
+    const ret = this.eat(':') ? this.type() : null
+    this.expect('=>')
+    return this.is('{') ? { n: 'arrow', pos, params, ret, body: this.block() } : { n: 'arrow', pos, params, ret, value: this.expr() }
+  }
+  private primary(): any {
+    const t = this.t, pos = t.pos
+    if (t.k === 'id' && this.is('=>', 1) && !RESERVED.has(t.v)) return this.arrow(pos)
+    if (t.k === 'op' && t.v === '(') {
+      const fn = this.attempt(() => this.arrow(pos))
+      if (fn) return fn
+    }
+    this.i++
+    switch (t.k) {
+      case 'num': {
+        if (/^\d.*n$/.test(t.v) || this.t.v === 'n' && this.t.pos === pos + t.v.length) this.err('bigint is not supported', t)
+        const float = !/^0[xXbB]/.test(t.v) && /[.eE]/.test(t.v)
+        return { n: 'num', pos, v: Number(t.v), float }
+      }
+      case 'str': return { n: 'str', pos, v: t.v }
+      case 'tpl': return { n: 'tpl', pos, quasis: t.quasis, exprs: t.holes!.map(h => new Parser(this.file, lex(this.file, h.src, h.pos)).whole()) }
+      case 'id':
+        if (t.v === 'true' || t.v === 'false') return { n: 'bool', pos, v: t.v === 'true' }
+        if (t.v === 'null') return { n: 'null', pos }
+        if (t.v === 'new') {
+          let f: any = { n: 'id', pos: this.t.pos, name: this.ident() }
+          while (this.eat('.')) f = { n: 'fld', pos, e: f, name: this.ident() }
+          if (this.is('<')) this.attempt(() => { this.i++; do this.type(); while (this.eat(',')); this.expect('>') })
+          return { n: 'new', pos, f, args: this.eat('(') ? this.args() : [] }
+        }
+        if (t.v === 'function') this.err('function expressions are not supported: use an arrow or a declaration', t)
+        if (RESERVED.has(t.v)) this.err(`unexpected '${t.v}'`, t)
+        return { n: 'id', pos, name: t.v }
+      case 'op':
+        if (t.v === '(') { const e = this.expr(); this.expect(')'); return e }
+        if (t.v === '{') {
+          const props: [string, any][] = []
+          while (!this.eat('}')) {
+            const k = this.toks[this.i++]
+            if (k.k !== 'id' && k.k !== 'str' && k.k !== 'num') this.err('expected a property name', k)
+            props.push([k.v, this.eat(':') ? this.expr() : k.k === 'id' ? { n: 'id', pos: k.pos, name: k.v } : this.err('expected :')])
+            if (!this.is('}')) this.expect(',')
+          }
+          return { n: 'obj', pos, props }
+        }
+        if (t.v === '[') {
+          const items: any[] = []
+          while (!this.eat(']')) { items.push(this.expr()); if (!this.is(']')) this.expect(',') }
+          return { n: 'arr', pos, items }
+        }
+    }
+    return this.err(`unexpected '${t.v}'`, t)
+  }
+  /** A whole token stream as one expression: the inside of a template's ${ }. */
+  whole(): any { const e = this.expr(); if (this.t.k !== 'eof') this.err(`unexpected '${this.t.v}'`); return e }
+
+  // ---- statements
+
+  block(): any[] {
+    this.expect('{')
+    const out: any[] = []
+    for (this.semi(); !this.eat('}'); this.semi()) out.push(this.stmt())
+    return out
+  }
+  private body(): any[] { return this.is('{') ? this.block() : [this.stmt()] }
+  /** An expression, an assignment or an increment: what a statement or a for clause may be. */
+  private simple(): any {
+    const pos = this.t.pos, e = this.expr(), op = this.t
+    if (op.k === 'op' && ASSIGN.has(op.v)) {
+      this.i++
+      const value = this.expr()
+      if (this.t.k === 'op' && ASSIGN.has(this.t.v)) this.err('chained assignment is not supported')
+      return { n: 'assign', pos, op: op.v, to: e, e: value }
+    }
     return { n: 'expr', pos, e }
   }
-
-  // ---- declarations ----
-  function params(allowAny: boolean): { params: any[]; variadic: boolean } {
+  private declarations(): any[] {
+    const isConst = this.t.v === 'const'
+    if (this.t.v === 'var') this.err("use 'let' or 'const'")
+    this.i++
     const out: any[] = []
-    let variadic = false
-    expect('(')
-    while (!eat(')')) {
-      if (allowAny && eat('...')) { variadic = true; expect(')'); break }
-      const name = ident(); expect(':')
-      out.push({ name, t: type() })
-      if (!is(')')) expect(',')
-    }
-    return { params: out, variadic }
+    do {
+      const pos = this.t.pos
+      if (this.is('{') || this.is('[')) this.err('destructuring is not supported')
+      const name = this.ident(), t = this.eat(':') ? this.type() : null
+      out.push({ n: 'let', pos, name, t, e: this.eat('=') ? this.expr() : null, isConst })
+    } while (this.eat(','))
+    return out
   }
-  function decl(): any {
-    let exported = false, inline = false
-    for (;;) { if (eat('export')) exported = true; else if (eat('inline')) inline = true; else break }
-    const pos = peek().pos
-    if (eat('fn')) {
-      const name = ident(), p = params(false)
-      return { n: 'fn', pos, name, exported, inline, params: p.params, ret: eat(':') ? type() : null, body: block() }
-    }
-    if (exported || inline) err("expected 'fn'")
-    if (eat('const')) {
-      const name = ident(), t = eat(':') ? type() : null
-      expect('=')
-      return { n: 'const', pos, name, t, e: expr() }
-    }
-    if (eat('var')) {
-      const name = ident(), t = eat(':') ? type() : null
-      return { n: 'var', pos, name, t, e: eat('=') ? expr() : t ? null : err('a var needs a type or an initializer') }
-    }
-    if (eat('static')) {
-      const name = ident(); expect(':'); expect('[')
-      const el = type(); expect(';')
-      const count = expr(); expect(']')
-      let init: any = null
-      if (eat('=')) {
-        if (eat('comptime')) init = { fn: ident() }
-        else { expect('['); const items: any[] = []; for (sep(); !eat(']'); sep()) items.push(expr()); init = { items } }
+  stmt(): any {
+    const t = this.t, pos = t.pos
+    if (this.is('{')) return { n: 'block', pos, body: this.block() }
+    if (t.k !== 'id') return this.simple()
+    switch (t.v) {
+      case 'const': case 'let': case 'var': { const d = this.declarations(); return d.length === 1 ? d[0] : { n: 'seq', pos, list: d } }
+      case 'if': {
+        this.i++; this.expect('(')
+        const c = this.expr(); this.expect(')')
+        const then = this.body()
+        this.semi()
+        return { n: 'if', pos, c, then, else: this.eat('else') ? this.body() : null }
       }
-      return { n: 'static', pos, name, el, count, init }
-    }
-    if (eat('struct')) {
-      const name = ident(), fields: any[] = []
-      expect('{')
-      for (sep(); !eat('}'); sep()) { const f = ident(); expect(':'); fields.push({ name: f, t: type() }) }
-      return { n: 'struct', pos, name, fields }
-    }
-    if (eat('extern')) {
-      const kind = ident()
-      if (!EXTERN_KINDS.has(kind)) err(`unknown extern kind '${kind}' (expected fn, call, get, set, new, val or js)`)
-      if (kind === 'js') {                         // extern js name(params): T = "any JavaScript expression that yields a function"
-        const name = ident(), p = params(true), ret = eat(':') ? type() : null
-        expect('=')
-        const src = toks[i++]
-        if (src.k !== 'str') err('expected the JavaScript source as a string', src)
-        return { n: 'extern', pos, name, kind, path: name, source: src.v, short: false, params: p.params, variadic: p.variadic, ret }
+      case 'while': { this.i++; this.expect('('); const c = this.expr(); this.expect(')'); return { n: 'while', pos, c, body: this.body() } }
+      case 'do': {
+        this.i++
+        const body = this.body()
+        this.expect('while'); this.expect('(')
+        const c = this.expr(); this.expect(')')
+        return { n: 'dowhile', pos, c, body }
       }
-      let path = ident(), last = path
-      while (eat('.')) path += '.' + (last = ident())
-      const short = !is('('), p = short ? { params: [], variadic: false } : params(true)
-      const ret = eat(':') ? type() : null
-      const name = eat('as') ? ident() : kind === 'set' ? 'set_' + last : last
-      return { n: 'extern', pos, name, kind, path, short, params: p.params, variadic: p.variadic, ret }
+      case 'for': {
+        this.i++; this.expect('(')
+        let init: any[] = []
+        if (!this.is(';')) init = this.is('let') || this.is('const') ? this.declarations() : [this.simple()]
+        if (this.is('of') || this.is('in')) this.err('for...of and for...in are not supported: use an index')
+        this.expect(';')
+        const c = this.is(';') ? null : this.expr()
+        this.expect(';')
+        const update: any[] = []
+        while (!this.is(')')) { update.push(this.simple()); if (!this.is(')')) this.expect(',') }
+        this.expect(')')
+        return { n: 'for', pos, init, c, update, body: this.body() }
+      }
+      case 'break': case 'continue': this.i++; if (this.t.k === 'id' && !this.t.nl) this.err('labels are not supported'); return { n: t.v, pos }
+      case 'return': this.i++; return { n: 'return', pos, e: this.t.nl || this.is('}') || this.is(';') ? null : this.expr() }
+      case 'function': this.err('nested functions are not supported: declare it at the top of the file')
+      case 'switch': case 'throw': case 'try': case 'class': this.err(`'${t.v}' is not supported`)
     }
-    return err(`expected a declaration, found '${peek().v}'`)
+    return this.simple()
   }
 
-  const imports: { path: string; pos: number }[] = [], decls: any[] = []
-  for (sep(); peek().k !== 'eof'; sep()) {
-    const pos = peek().pos
-    if (eat('import')) { const t = toks[i++]; if (t.k !== 'str') err('expected a path string', t); imports.push({ path: t.v, pos }) }
-    else decls.push(decl())
+  // ---- top level
+
+  program(): Ast {
+    const imports: Ast['imports'] = [], top: any[] = []
+    for (this.semi(); this.t.k !== 'eof'; this.semi()) {
+      const t = this.t, pos = t.pos
+      if (this.is('import') && !this.is('(', 1)) {
+        this.i++
+        const typeOnly = this.is('type') && !this.is('from', 1) && !this.is(',', 1) && this.eat('type')
+        const imp: Ast['imports'][number] = { names: [], from: '', pos }
+        if (this.t.k === 'id') { imp.default = this.ident(); this.eat(',') }
+        if (this.eat('{')) {
+          while (!this.eat('}')) {
+            const one = this.is('type') && !this.is(',', 1) && !this.is('}', 1) && !this.is('as', 1) && this.eat('type')
+            const name = this.ident(), as = this.eat('as') ? this.ident() : name
+            if (!typeOnly && !one) imp.names.push({ name, as })
+            else imp.names.push({ name, as })                    // a type import still names a declaration
+            if (!this.is('}')) this.expect(',')
+          }
+        }
+        if (this.is('*')) this.err('namespace imports are not supported: name what you import')
+        this.expect('from')
+        if (this.t.k !== 'str') this.err('expected a module path')
+        imp.from = this.toks[this.i++].v
+        if (this.eat('with')) this.primary()                     // import attributes
+        imports.push(imp)
+        continue
+      }
+      const exported = this.eat('export')
+      if (exported && this.eat('default')) this.err('default exports are not supported: export by name')
+      const inline = !!t.inline || !!this.t.inline
+      if (this.eat('declare')) {                                 // a promise about JavaScript: for the type checker only
+        if (this.eat('function')) { this.ident(); this.params(); if (this.eat(':')) this.type() }
+        else if (this.eat('const') || this.eat('let') || this.eat('var')) do { this.ident(); if (this.eat(':')) this.type() } while (this.eat(','))
+        else this.err("only 'declare const' and 'declare function' are supported")
+        continue
+      }
+      if (this.eat('function')) {
+        const name = this.ident(), params = this.params()
+        for (const p of params) if (!p.t) this.err(`parameter '${p.name}' needs a type`, t)
+        top.push({ n: 'fn', pos, name, exported, inline, params, ret: this.eat(':') ? this.type() : null, body: this.block() })
+      } else if (this.is('const') || this.is('let') || this.is('var')) {
+        for (const d of this.declarations()) top.push({ ...d, n: 'var', exported })
+      } else if (this.eat('interface')) {
+        const name = this.ident()
+        if (this.is('extends') || this.is('<')) this.err('interfaces that extend or take type parameters are not supported')
+        const body = this.typePrimary()
+        top.push({ n: 'alias', pos, name, exported, t: body })
+      } else if (this.is('type') && this.toks[this.i + 1].k === 'id' && this.is('=', 2)) {
+        this.i++
+        const name = this.ident()
+        this.expect('=')
+        top.push({ n: 'alias', pos, name, exported, t: this.type() })
+      } else if (exported) this.err('expected a declaration to export')
+      else top.push({ n: 'stmt', pos, s: this.stmt() })
+    }
+    return { imports, top }
   }
-  return { imports, decls }
 }
 
 /** Calls `f` on every AST node under `node` (including `node`). */
@@ -264,5 +438,5 @@ export function walk(node: any, f: (n: any) => void): void {
   if (Array.isArray(node)) { for (const x of node) walk(x, f); return }
   if (!node || typeof node !== 'object') return
   if (node.n) f(node)
-  for (const k in node) if (k !== 'file') walk(node[k], f)
+  for (const k in node) if (k !== 'mod') walk(node[k], f)
 }

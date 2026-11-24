@@ -1,22 +1,50 @@
-// How a Nib module reaches JavaScript.
+// How a compiled module reaches JavaScript.
 //
-// Wasm can only call what it imports, so the compiler writes one line of JavaScript per distinct
-// binding and collects them in a table:
+// Wasm can only call what it imports. For each distinct use of a JavaScript value in the source
+// (a DOM call, a property, an object literal) the compiler writes one arrow function, with
+// constants written in and exactly the arguments that vary:
 //
-//   {n1x9k2a:[(a,b)=>a.getElementById(b), (a)=>({size:a,usage:72}), globalThis.document, "input"]}
+//   canvas.getContext('webgpu')                       (a)=>a.getContext("webgpu")
+//   device.createBuffer({ size: n, usage: 72 })       (a,b)=>a.createBuffer({size:b,usage:72})
 //
-// The module imports from that table by position. The table is plain script: nothing is
-// evaluated from strings at run time, so a page works under a Content-Security-Policy of
+// They go into a table, with the memory, and the module imports from it by position. The table
+// is plain script, so a page works under a Content-Security-Policy of
 //
 //   default-src 'self'; script-src 'self' 'wasm-unsafe-eval'
-//
-// Each arrow has exactly the arity of the call it serves. Measured in Chromium, that is as fast
-// as hand-written glue and faster than binding native functions directly (see README.md).
 
-/** The whole script a page loads: fetch, link against the bindings, call `main(exports)` if it is exported. */
-export const boot = (wasmUrl: string, bindings: string): string =>
-  `WebAssembly.instantiateStreaming(fetch(${JSON.stringify(wasmUrl)}),${bindings}).then(r=>r.instance.exports.main?.(r.instance.exports))\n`
+export type Export =
+  | { name: string; kind: 'function'; wrap?: string }       // wrap: converts objects, booleans and arrays at the edge
+  | { name: string; kind: 'value'; value: unknown }
+  | { name: string; kind: 'view'; ctor: string; addr: number; length: number }
 
-/** Instantiates a compiled module in the current JavaScript environment: for the compiler itself and for tests. */
-export const instantiate = (wasm: Uint8Array<ArrayBuffer>, bindings: string): WebAssembly.Instance =>
-  new WebAssembly.Instance(new WebAssembly.Module(wasm), (0, eval)(`(${bindings})`))
+export interface Glue {
+  key: string               // the import module name: a hash of the table, so a stale table cannot link
+  entries: string[]         // JavaScript source of each binding
+  pages: number             // memory size in 64 KiB pages; 0 for a module without memory
+  start: boolean            // the module has top-level code to run
+  exports: Export[]
+}
+
+const prelude = (g: Glue) => g.pages ? `const M$=new WebAssembly.Memory({initial:${g.pages}}),V$=(C,p,n)=>new C(M$.buffer,p,n)\n` : ''
+const imports = (g: Glue) => g.entries.length ? `{${g.key}:[${g.entries.join()}]}` : '{}'
+const exported = (e: Export) => e.kind === 'function' ? e.wrap ?? `X$.${e.name}` : e.kind === 'view' ? `V$(${e.ctor},${e.addr},${e.length})` : JSON.stringify(e.value)
+
+/**
+ * The ES module that stands in for the TypeScript file: it has the same exports. Functions are
+ * the compiled ones, and typed arrays are views of the module's memory, so the rest of an
+ * application reads and writes game state with no copies.
+ */
+export const moduleSource = (g: Glue, wasmUrl: string): string =>
+  prelude(g) +
+  `const X$=(await WebAssembly.instantiateStreaming(fetch(new URL(${JSON.stringify(wasmUrl)},import.meta.url)),${imports(g)})).instance.exports\n` +
+  (g.start ? 'X$.__start()\n' : '') +
+  (g.exports.length ? `export const ${g.exports.map(e => `${e.name}=${exported(e)}`).join()}\n` : '')
+
+/** Instantiates a compiled module right here: for the compiler's build-time evaluation and for tests. */
+export function instantiate(wasm: Uint8Array<ArrayBuffer>, g: Glue): any {
+  const body = prelude(g) +
+    `const X$=new WebAssembly.Instance(new WebAssembly.Module(bytes),${imports(g)}).exports\n` +
+    (g.start ? 'X$.__start()\n' : '') +
+    `return{...X$,${g.pages ? 'memory:M$,' : ''}${g.exports.map(e => `${e.name}:${exported(e)}`).join()}}`
+  return new Function('bytes', body)(wasm)
+}
